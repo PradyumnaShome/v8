@@ -494,9 +494,15 @@ namespace internal {
   F(ActiveTierIsSparkplug, 1, 1)              \
   F(ActiveTierIsMaglev, 1, 1)                 \
   F(ActiveTierIsTurbofan, 1, 1)               \
+  F(AddressOfArray, -1, 1)                    \
   F(ArrayIteratorProtector, 0, 1)             \
   F(ArraySpeciesProtector, 0, 1)              \
   F(BaselineOsr, -1, 1)                       \
+  F(QOSClassUserInteractive, 0, 1)            \
+  F(QOSClassUserInitiated, 0, 1)              \
+  F(QOSClassUtility, 0, 1)                    \
+  F(QOSClassBackground, 0, 1)                 \
+  F(TimeLoad, 2, 1)                           \
   F(BenchMaglev, 2, 1)                        \
   F(ClearFunctionFeedback, 1, 1)              \
   F(ClearMegamorphicStubCache, 0, 1)          \

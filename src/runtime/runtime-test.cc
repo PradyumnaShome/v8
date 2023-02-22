@@ -36,6 +36,8 @@
 #include "src/profiler/heap-snapshot-generator.h"
 #include "src/regexp/regexp.h"
 #include "src/snapshot/snapshot.h"
+#include "src/init/v8.h"
+#include "include/v8.h"
 
 #ifdef V8_ENABLE_MAGLEV
 #include "src/maglev/maglev.h"
@@ -44,6 +46,10 @@
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/wasm-engine.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
+
+#include <dlfcn.h>
+#include <inttypes.h>
+#include <stdint.h>
 
 namespace v8 {
 namespace internal {
@@ -1121,6 +1127,101 @@ RUNTIME_FUNCTION(Runtime_DebugPrint) {
   return args[0];
 }
 
+/*
+ Added % functions to ask for QoS classes in macOS.
+ */
+RUNTIME_FUNCTION(Runtime_QOSClassUserInteractive) {
+  int ret = pthread_set_qos_class_self_np(qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+  fprintf(stderr, "QoS to USER_INTERACTIVE returned %d\n", ret);
+  return Object();
+}
+
+RUNTIME_FUNCTION(Runtime_QOSClassUserInitiated) {
+  int ret = pthread_set_qos_class_self_np(qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+  fprintf(stderr, "QoS to USER_INITIATED returned %d\n", ret);
+  return Object();
+}
+
+RUNTIME_FUNCTION(Runtime_QOSClassUtility) {
+  int ret = pthread_set_qos_class_self_np(qos_class_t::QOS_CLASS_UTILITY, 0);
+  fprintf(stderr, "QoS to UTILITY returned %d\n", ret);
+  return Object();
+}
+
+RUNTIME_FUNCTION(Runtime_QOSClassBackground) {
+  int ret = pthread_set_qos_class_self_np(qos_class_t::QOS_CLASS_BACKGROUND, 0);
+  fprintf(stderr, "QoS to BACKGROUND returned %d\n", ret);
+  return Object();
+}
+
+/*
+ Function to time loads with cycle counter.
+ Because Chrome makes anything that is not a Smi (small integer)
+ a HeapObject, this function uses Smis for simplicity.
+ However, Smis are 32 bits wide with the lowest bit being reserved,
+ so to represent a 48-bit canonical pointer, we need 2 smis.
+ The first argument is the upper 32 bits, and the second argument is
+ the lower 32 bits.  
+ */
+RUNTIME_FUNCTION(Runtime_TimeLoad) {
+  DCHECK_EQ(2, args.length());
+  HandleScope scope(isolate);
+  // Snapshot::SerializeDeserializeAndVerifyForTesting(isolate,
+                                                    // isolate->native_context());
+  
+  // Convert the Smis to a pointer.
+  uint32_t hi = NumberToUint32(args[0]);
+  uint32_t lo = NumberToUint32(args[1]);
+  uint64_t ptr = (static_cast<uint64_t>(hi) << 32) | lo;
+  // fprintf(stderr, "Reconstructed pointer: %p\n", (void*)ptr);
+
+  // Chromium MUST BE RUN AS ROOT for this to work.
+  const char *kperf_path = "/System/Library/PrivateFrameworks/kperf.framework/Versions/A/kperf";
+  void *kperf_lib = NULL;
+  int (*kpc_get_thread_counters)(int, unsigned, uint64_t *) = NULL;
+
+  // The array size is the size of the entire array divided by the size of the
+  // first element, i.e. this macro expands to the number of elements in the
+  // array.
+  #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+
+  // We cannot open the KPC API provided by the kernel ourselves directly.
+	// Instead we rely on the kperf framework which is entitled to access
+	// this API.
+	kperf_lib = dlopen(kperf_path, RTLD_LAZY);
+
+  if (!kperf_lib) {
+    return ReadOnlyRoots(isolate).undefined_value();
+  }
+
+  // Look up kpc_get_thread_counters.
+  // Need to do some casting here because compiler will complain about
+  // assigning void pointer to function pointer
+	*(void **)(&kpc_get_thread_counters) = dlsym(kperf_lib, "kpc_get_thread_counters");
+
+  // Storage space for performance counters on two timestamps.
+  // Read with serialization on both sides.
+	uint64_t counters_before[10];
+  uint64_t counters_after[10];
+
+  // Timestamp 1
+  asm volatile ("isb sy");
+  kpc_get_thread_counters(0, ARRAY_SIZE(counters_before), counters_before);
+  asm volatile ("isb sy");
+
+  // Target access
+  *(volatile char *) ptr;
+  asm volatile("dsb ish"); // lfence
+
+  // Timestamp 2
+  asm volatile ("isb sy");
+  kpc_get_thread_counters(0, ARRAY_SIZE(counters_after), counters_after);
+  asm volatile ("isb sy");
+
+  uint64_t dt = counters_after[2] - counters_before[2];
+  return Smi::FromInt((int)dt);
+}
+
 RUNTIME_FUNCTION(Runtime_DebugPrintPtr) {
   SealHandleScope shs(isolate);
   StdoutStream os;
@@ -1137,6 +1238,29 @@ RUNTIME_FUNCTION(Runtime_DebugPrintPtr) {
   }
   // We don't allow the converted pointer to leak out to JavaScript.
   return args[0];
+}
+
+RUNTIME_FUNCTION(Runtime_AddressOfArray) {
+  HandleScope hs(isolate);
+  StdoutStream os;
+
+  MaybeObject maybe_object(*args.address_of_arg_at(0));
+  Object object = maybe_object.GetHeapObjectOrSmi();
+  void* data_pointer = JSTypedArray::cast(object).DataPtr();
+
+  std::ostringstream stream;
+  stream << data_pointer;
+  std::string data_pointer_string = stream.str();
+  // os << "[Original Pointer] " << data_pointer_string << "\n";
+
+  data_pointer_string = data_pointer_string.substr(2, data_pointer_string.size() - 2);
+
+  long number = stol(data_pointer_string, nullptr, 16);
+
+
+  Handle<v8::internal::Object> number_handle = isolate->factory()->NewNumber(number);
+  
+  return *number_handle;
 }
 
 RUNTIME_FUNCTION(Runtime_PrintWithNameForAssert) {
