@@ -451,7 +451,7 @@ bool InstructionSelector::CanAddressRelativeToRootsRegister(
   // 3. IsAddressableThroughRootRegister: Is the target address guaranteed to
   //    have a fixed root-relative offset? If so, we can ignore 2.
   const bool this_root_relative_offset_is_constant =
-      TurboAssemblerBase::IsAddressableThroughRootRegister(isolate(),
+      MacroAssemblerBase::IsAddressableThroughRootRegister(isolate(),
                                                            reference);
   return this_root_relative_offset_is_constant;
 }
@@ -1154,7 +1154,9 @@ bool InstructionSelector::IsSourcePositionUsed(Node* node) {
           node->opcode() == IrOpcode::kTrapIf ||
           node->opcode() == IrOpcode::kTrapUnless ||
           node->opcode() == IrOpcode::kProtectedLoad ||
-          node->opcode() == IrOpcode::kProtectedStore);
+          node->opcode() == IrOpcode::kProtectedStore ||
+          node->opcode() == IrOpcode::kLoadTrapOnNull ||
+          node->opcode() == IrOpcode::kStoreTrapOnNull);
 }
 
 void InstructionSelector::VisitBlock(BasicBlock* block) {
@@ -1174,6 +1176,7 @@ void InstructionSelector::VisitBlock(BasicBlock* block) {
         node->opcode() == IrOpcode::kUnalignedStore ||
         node->opcode() == IrOpcode::kCall ||
         node->opcode() == IrOpcode::kProtectedStore ||
+        node->opcode() == IrOpcode::kStoreTrapOnNull ||
 #define ADD_EFFECT_FOR_ATOMIC_OP(Opcode) \
   node->opcode() == IrOpcode::k##Opcode ||
         MACHINE_ATOMIC_OP_LIST(ADD_EFFECT_FOR_ATOMIC_OP)
@@ -1481,6 +1484,7 @@ void InstructionSelector::VisitNode(Node* node) {
     case IrOpcode::kStore:
       return VisitStore(node);
     case IrOpcode::kProtectedStore:
+    case IrOpcode::kStoreTrapOnNull:
       return VisitProtectedStore(node);
     case IrOpcode::kStoreLane: {
       MarkAsRepresentation(MachineRepresentation::kSimd128, node);
@@ -1925,7 +1929,8 @@ void InstructionSelector::VisitNode(Node* node) {
       ATOMIC_CASE(Exchange)
       ATOMIC_CASE(CompareExchange)
 #undef ATOMIC_CASE
-    case IrOpcode::kProtectedLoad: {
+    case IrOpcode::kProtectedLoad:
+    case IrOpcode::kLoadTrapOnNull: {
       LoadRepresentation type = LoadRepresentationOf(node->op());
       MarkAsRepresentation(type.representation(), node);
       return VisitProtectedLoad(node);
@@ -2810,26 +2815,6 @@ void InstructionSelector::VisitI64x2ReplaceLane(Node* node) { UNIMPLEMENTED(); }
         // !V8_TARGET_ARCH_RISCV64 && !V8_TARGET_ARCH_RISCV32
 #endif  // !V8_TARGET_ARCH_ARM64
 #endif  // !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_S390X && !V8_TARGET_ARCH_PPC64
-
-#if !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_S390X && !V8_TARGET_ARCH_PPC64 && \
-    !V8_TARGET_ARCH_ARM64 && !V8_TARGET_ARCH_IA32 &&                         \
-    !V8_TARGET_ARCH_RISCV32 && !V8_TARGET_ARCH_RISCV64
-void InstructionSelector::VisitF64x2Qfma(Node* node) { UNIMPLEMENTED(); }
-void InstructionSelector::VisitF64x2Qfms(Node* node) { UNIMPLEMENTED(); }
-void InstructionSelector::VisitF32x4Qfma(Node* node) { UNIMPLEMENTED(); }
-void InstructionSelector::VisitF32x4Qfms(Node* node) { UNIMPLEMENTED(); }
-#endif  // !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_S390X && !V8_TARGET_ARCH_PPC64
-        // && !V8_TARGET_ARCH_ARM64 && !V8_TARGET_ARCH_IA32 &&
-        // !V8_TARGET_ARCH_RISCV64 && !V8_TARGET_ARCH_RISCV32
-
-#if !V8_TARGET_ARCH_ARM64 && !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_IA32
-void InstructionSelector::VisitI16x8DotI8x16I7x16S(Node* node) {
-  UNIMPLEMENTED();
-}
-void InstructionSelector::VisitI32x4DotI8x16I7x16AddS(Node* node) {
-  UNIMPLEMENTED();
-}
-#endif  // !V8_TARGET_ARCH_ARM6 && !V8_TARGET_ARCH_X64 && !V8_TARGET_ARCH_IA32
 
 void InstructionSelector::VisitFinishRegion(Node* node) { EmitIdentity(node); }
 

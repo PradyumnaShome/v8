@@ -158,6 +158,11 @@ v8_flag(
     default = True,
 )
 
+v8_flag(
+    name = "v8_jitless",
+    default = False,
+)
+
 v8_int(
     name = "v8_typed_array_max_size_in_heap",
     default = 64,
@@ -333,6 +338,7 @@ v8_config(
         "v8_enable_verify_heap": "VERIFY_HEAP",
         "v8_enable_verify_predictable": "VERIFY_PREDICTABLE",
         "v8_enable_webassembly": "V8_ENABLE_WEBASSEMBLY",
+        "v8_jitless": "V8_JITLESS",
     },
     defines = [
         "GOOGLE3",
@@ -716,7 +722,6 @@ filegroup(
         "@v8//bazel/config:is_macos": [
             "src/base/debug/stack_trace_posix.cc",
             "src/base/platform/platform-darwin.cc",
-            "src/base/platform/platform-macos.cc",
         ],
         "@v8//bazel/config:is_windows": [
             "src/base/win32-headers.h",
@@ -826,6 +831,7 @@ filegroup(
         "src/builtins/internal-coverage.tq",
         "src/builtins/internal.tq",
         "src/builtins/iterator.tq",
+        "src/builtins/iterator-helpers.tq",
         "src/builtins/math.tq",
         "src/builtins/number.tq",
         "src/builtins/object-fromentries.tq",
@@ -936,6 +942,7 @@ filegroup(
         "src/objects/js-collection.tq",
         "src/objects/js-function.tq",
         "src/objects/js-generator.tq",
+        "src/objects/js-iterator-helpers.tq",
         "src/objects/js-objects.tq",
         "src/objects/js-promise.tq",
         "src/objects/js-proxy.tq",
@@ -1243,8 +1250,8 @@ filegroup(
         "src/codegen/tick-counter.h",
         "src/codegen/tnode.cc",
         "src/codegen/tnode.h",
-        "src/codegen/turbo-assembler.cc",
-        "src/codegen/turbo-assembler.h",
+        "src/codegen/macro-assembler-base.cc",
+        "src/codegen/macro-assembler-base.h",
         "src/codegen/unoptimized-compilation-info.cc",
         "src/codegen/unoptimized-compilation-info.h",
         "src/common/assert-scope.cc",
@@ -1775,6 +1782,8 @@ filegroup(
         "src/objects/js-function.h",
         "src/objects/js-generator-inl.h",
         "src/objects/js-generator.h",
+        "src/objects/js-iterator-helpers-inl.h",
+        "src/objects/js-iterator-helpers.h",
         "src/objects/js-objects-inl.h",
         "src/objects/js-objects.cc",
         "src/objects/js-objects.h",
@@ -2871,6 +2880,7 @@ filegroup(
         "src/compiler/turboshaft/dead-code-elimination-reducer.h",
         "src/compiler/turboshaft/decompression-optimization.cc",
         "src/compiler/turboshaft/decompression-optimization.h",
+        "src/compiler/turboshaft/define-assembler-macros.inc",
         "src/compiler/turboshaft/deopt-data.h",
         "src/compiler/turboshaft/fast-hash.h",
         "src/compiler/turboshaft/graph-builder.cc",
@@ -2902,12 +2912,17 @@ filegroup(
         "src/compiler/turboshaft/simplify-tf-loops.cc",
         "src/compiler/turboshaft/simplify-tf-loops.h",
         "src/compiler/turboshaft/snapshot-table.h",
+        "src/compiler/turboshaft/tag-untag-lowering-reducer.h",
+        "src/compiler/turboshaft/type-inference-analysis.h",
         "src/compiler/turboshaft/type-inference-reducer.h",
+        "src/compiler/turboshaft/typer.cc",
+        "src/compiler/turboshaft/typer.h",
         "src/compiler/turboshaft/type-parser.cc",
         "src/compiler/turboshaft/type-parser.h",
         "src/compiler/turboshaft/typed-optimizations-reducer.h",
         "src/compiler/turboshaft/types.cc",
         "src/compiler/turboshaft/types.h",
+        "src/compiler/turboshaft/undef-assembler-macros.inc",
         "src/compiler/turboshaft/uniform-reducer-adapter.h",
         "src/compiler/turboshaft/utils.cc",
         "src/compiler/turboshaft/utils.h",
@@ -3035,7 +3050,6 @@ filegroup(
         "src/builtins/builtins-constructor.h",
         "src/builtins/builtins-conversion-gen.cc",
         "src/builtins/builtins-data-view-gen.h",
-        "src/builtins/builtins-data-view-gen.cc",
         "src/builtins/builtins-date-gen.cc",
         "src/builtins/builtins-generator-gen.cc",
         "src/builtins/builtins-global-gen.cc",
@@ -3808,6 +3822,7 @@ v8_binary(
         "@v8//bazel/config:is_posix": ["-fexceptions"],
         "//conditions:default": [],
     }),
+    icu_defines = [ "V8_INTL_SUPPORT" ],
     features = ["-use_header_modules"],
     linkopts = select({
         "@v8//bazel/config:is_android": ["-llog"],
@@ -3854,8 +3869,13 @@ v8_binary(
 
 # This target forces torque to be compiled without pointer compression.
 v8_binary_non_pointer_compression(
-    name = "torque_non_pointer_compression",
-    binary = "torque",
+    name = "noicu/torque_non_pointer_compression",
+    binary = "noicu/torque",
+)
+
+v8_binary_non_pointer_compression(
+    name = "icu/torque_non_pointer_compression",
+    binary = "icu/torque",
 )
 
 alias(

@@ -50,6 +50,7 @@
 #include "src/objects/js-duration-format-inl.h"
 #endif  // V8_INTL_SUPPORT
 #include "src/objects/js-generator-inl.h"
+#include "src/objects/js-iterator-helpers-inl.h"
 #ifdef V8_INTL_SUPPORT
 #include "src/objects/js-list-format-inl.h"
 #include "src/objects/js-locale-inl.h"
@@ -589,8 +590,8 @@ void Map::MapVerify(Isolate* isolate) {
                     IsSharedArrayElementsKind(elements_kind()));
   CHECK_IMPLIES(is_deprecated(), !is_stable());
   if (is_prototype_map()) {
-    DCHECK(prototype_info() == Smi::zero() ||
-           prototype_info().IsPrototypeInfo());
+    CHECK(prototype_info() == Smi::zero() ||
+          prototype_info().IsPrototypeInfo());
   }
 }
 
@@ -1276,6 +1277,17 @@ void JSSharedArray::JSSharedArrayVerify(Isolate* isolate) {
   }
 }
 
+void JSIteratorMapHelper::JSIteratorMapHelperVerify(Isolate* isolate) {
+  TorqueGeneratedClassVerifiers::JSIteratorMapHelperVerify(*this, isolate);
+  CHECK(mapper().IsCallable());
+  CHECK_GE(counter().Number(), 0);
+}
+
+void JSIteratorFilterHelper::JSIteratorFilterHelperVerify(Isolate* isolate) {
+  TorqueGeneratedClassVerifiers::JSIteratorFilterHelperVerify(*this, isolate);
+  UNIMPLEMENTED();
+}
+
 void WeakCell::WeakCellVerify(Isolate* isolate) {
   CHECK(IsWeakCell());
 
@@ -1640,6 +1652,18 @@ void JSTypedArray::JSTypedArrayVerify(Isolate* isolate) {
 
 void JSDataView::JSDataViewVerify(Isolate* isolate) {
   TorqueGeneratedClassVerifiers::JSDataViewVerify(*this, isolate);
+  CHECK(!IsVariableLength());
+  if (!WasDetached()) {
+    CHECK_EQ(reinterpret_cast<uint8_t*>(
+                 JSArrayBuffer::cast(buffer()).backing_store()) +
+                 byte_offset(),
+             data_pointer());
+  }
+}
+
+void JSRabGsabDataView::JSRabGsabDataViewVerify(Isolate* isolate) {
+  TorqueGeneratedClassVerifiers::JSRabGsabDataViewVerify(*this, isolate);
+  CHECK(IsVariableLength());
   if (!WasDetached()) {
     CHECK_EQ(reinterpret_cast<uint8_t*>(
                  JSArrayBuffer::cast(buffer()).backing_store()) +

@@ -58,7 +58,7 @@ template <typename Impl>
 Handle<Struct> FactoryBase<Impl>::NewStruct(InstanceType type,
                                             AllocationType allocation) {
   ReadOnlyRoots roots = read_only_roots();
-  Map map = Map::GetInstanceTypeMap(roots, type);
+  Map map = Map::GetMapFor(roots, type);
   int size = map.instance_size();
   return handle(NewStructInternal(roots, map, size, allocation), isolate());
 }
@@ -94,7 +94,8 @@ Handle<FixedArray> FactoryBase<Impl>::NewFixedArray(int length,
                                                     AllocationType allocation) {
   if (length == 0) return impl()->empty_fixed_array();
   if (length < 0 || length > FixedArray::kMaxLength) {
-    FATAL("Fatal JavaScript invalid size error %d", length);
+    FATAL("Fatal JavaScript invalid size error %d (see crbug.com/1201626)",
+          length);
     UNREACHABLE();
   }
   return NewFixedArrayWithFiller(
@@ -160,7 +161,8 @@ Handle<FixedArrayBase> FactoryBase<Impl>::NewFixedDoubleArray(
     int length, AllocationType allocation) {
   if (length == 0) return impl()->empty_fixed_array();
   if (length < 0 || length > FixedDoubleArray::kMaxLength) {
-    FATAL("Fatal JavaScript invalid size error %d", length);
+    FATAL("Fatal JavaScript invalid size error %d (see crbug.com/1201626)",
+          length);
     UNREACHABLE();
   }
   int size = FixedDoubleArray::SizeFor(length);
@@ -1149,8 +1151,9 @@ FactoryBase<Impl>::NewSwissNameDictionaryWithCapacity(
   DCHECK(SwissNameDictionary::IsValidCapacity(capacity));
 
   if (capacity == 0) {
-    DCHECK_NE(read_only_roots().at(RootIndex::kEmptySwissPropertyDictionary),
-              kNullAddress);
+    DCHECK_NE(
+        read_only_roots().address_at(RootIndex::kEmptySwissPropertyDictionary),
+        kNullAddress);
 
     return read_only_roots().empty_swiss_property_dictionary_handle();
   }

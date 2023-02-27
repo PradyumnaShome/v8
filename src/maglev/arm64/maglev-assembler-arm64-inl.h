@@ -34,6 +34,19 @@ constexpr Condition ConditionFor(Operation operation) {
   }
 }
 
+inline int ShiftFromScale(int n) {
+  switch (n) {
+    case 1:
+      return 0;
+    case 2:
+      return 1;
+    case 4:
+      return 2;
+    default:
+      UNREACHABLE();
+  }
+}
+
 class MaglevAssembler::ScratchRegisterScope {
  public:
   explicit ScratchRegisterScope(MaglevAssembler* masm) : wrapped_scope_(masm) {
@@ -352,6 +365,18 @@ inline void MaglevAssembler::BuildTypedArrayDataPointer(Register data_pointer,
   Add(data_pointer, data_pointer, base);
 }
 
+inline void MaglevAssembler::LoadTaggedFieldByIndex(Register result,
+                                                    Register object,
+                                                    Register index, int scale,
+                                                    int offset) {
+  if (scale == 1) {
+    Add(result, object, index);
+  } else {
+    Add(result, object, Operand(index, LSL, ShiftFromScale(scale / 2)));
+  }
+  MacroAssembler::LoadTaggedField(result, FieldMemOperand(result, offset));
+}
+
 inline void MaglevAssembler::LoadBoundedSizeFromObject(Register result,
                                                        Register object,
                                                        int offset) {
@@ -373,26 +398,26 @@ inline void MaglevAssembler::LoadExternalPointerField(Register result,
 inline void MaglevAssembler::LoadSignedField(Register result,
                                              MemOperand operand, int size) {
   if (size == 1) {
-    ldrsb(result, operand);
+    Ldrsb(result, operand);
   } else if (size == 2) {
-    ldrsh(result, operand);
+    Ldrsh(result, operand);
   } else {
     DCHECK_EQ(size, 4);
     DCHECK(result.IsW());
-    ldr(result, operand);
+    Ldr(result, operand);
   }
 }
 
 inline void MaglevAssembler::LoadUnsignedField(Register result,
                                                MemOperand operand, int size) {
   if (size == 1) {
-    ldrb(result, operand);
+    Ldrb(result, operand);
   } else if (size == 2) {
-    ldrh(result, operand);
+    Ldrh(result, operand);
   } else {
     DCHECK_EQ(size, 4);
     DCHECK(result.IsW());
-    ldr(result, operand);
+    Ldr(result, operand);
   }
 }
 
@@ -400,13 +425,13 @@ inline void MaglevAssembler::StoreField(MemOperand operand, Register value,
                                         int size) {
   DCHECK(size == 1 || size == 2 || size == 4);
   if (size == 1) {
-    strb(value, operand);
+    Strb(value, operand);
   } else if (size == 2) {
-    strh(value, operand);
+    Strh(value, operand);
   } else {
     DCHECK_EQ(size, 4);
     DCHECK(value.IsW());
-    str(value, operand);
+    Str(value, operand);
   }
 }
 
@@ -445,7 +470,7 @@ inline void MaglevAssembler::Move(DoubleRegister dst, MemOperand src) {
   Ldr(dst, src);
 }
 inline void MaglevAssembler::Move(DoubleRegister dst, DoubleRegister src) {
-  fmov(dst, src);
+  Fmov(dst, src);
 }
 inline void MaglevAssembler::Move(Register dst, Smi src) {
   MacroAssembler::Move(dst, src);
@@ -465,12 +490,18 @@ inline void MaglevAssembler::Move(Register dst, int32_t i) {
 inline void MaglevAssembler::Move(DoubleRegister dst, double n) {
   Fmov(dst, n);
 }
+inline void MaglevAssembler::Move(DoubleRegister dst, Float64 n) {
+  Fmov(dst, n.get_scalar());
+}
 inline void MaglevAssembler::Move(Register dst, Handle<HeapObject> obj) {
   Mov(dst, Operand(obj));
 }
 
 inline void MaglevAssembler::SignExtend32To64Bits(Register dst, Register src) {
   Mov(dst, Operand(src.W(), SXTW));
+}
+inline void MaglevAssembler::NegateInt32(Register val) {
+  Neg(val.W(), val.W());
 }
 
 template <typename NodeT>
@@ -483,10 +514,10 @@ inline void MaglevAssembler::DeoptIfBufferDetached(Register array,
            ->DependOnArrayBufferDetachingProtector()) {
     // A detached buffer leads to megamorphic feedback, so we won't have a deopt
     // loop if we deopt here.
-    LoadTaggedPointerField(
-        scratch, FieldMemOperand(array, JSArrayBufferView::kBufferOffset));
-    LoadTaggedPointerField(
-        scratch, FieldMemOperand(scratch, JSArrayBuffer::kBitFieldOffset));
+    LoadTaggedField(scratch,
+                    FieldMemOperand(array, JSArrayBufferView::kBufferOffset));
+    LoadTaggedField(scratch,
+                    FieldMemOperand(scratch, JSArrayBuffer::kBitFieldOffset));
     Tst(scratch.W(), Immediate(JSArrayBuffer::WasDetachedBit::kMask));
     EmitEagerDeoptIf(ne, DeoptimizeReason::kArrayBufferWasDetached, node);
   }
@@ -494,6 +525,13 @@ inline void MaglevAssembler::DeoptIfBufferDetached(Register array,
 
 inline void MaglevAssembler::LoadByte(Register dst, MemOperand src) {
   Ldrb(dst, src);
+}
+
+inline void MaglevAssembler::IsObjectType(Register heap_object,
+                                          InstanceType type) {
+  ScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  MacroAssembler::IsObjectType(heap_object, scratch, scratch, type);
 }
 
 inline void MaglevAssembler::CompareObjectType(Register heap_object,
@@ -519,6 +557,20 @@ inline void MaglevAssembler::CompareObjectTypeRange(Register heap_object,
   CompareInstanceTypeRange(scratch, scratch, lower_limit, higher_limit);
 }
 
+inline void MaglevAssembler::CompareInstanceTypeRange(
+    Register map, InstanceType lower_limit, InstanceType higher_limit) {
+  ScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  CompareInstanceTypeRange(map, scratch, lower_limit, higher_limit);
+}
+
+inline void MaglevAssembler::CompareInstanceTypeRange(
+    Register map, Register instance_type_out, InstanceType lower_limit,
+    InstanceType higher_limit) {
+  MacroAssembler::CompareInstanceTypeRange(map, instance_type_out, lower_limit,
+                                           higher_limit);
+}
+
 inline void MaglevAssembler::CompareTagged(Register reg,
                                            Handle<HeapObject> obj) {
   ScratchRegisterScope temps(this);
@@ -535,11 +587,16 @@ inline void MaglevAssembler::CompareInt32(Register src1, Register src2) {
   Cmp(src1.W(), src2.W());
 }
 
+inline void MaglevAssembler::CallSelf() {
+  DCHECK(code_gen_state()->entry_label()->is_bound());
+  Bl(code_gen_state()->entry_label());
+}
+
 inline void MaglevAssembler::Jump(Label* target, Label::Distance) { B(target); }
 
 inline void MaglevAssembler::JumpIf(Condition cond, Label* target,
                                     Label::Distance) {
-  b(target, cond);
+  B(target, cond);
 }
 
 inline void MaglevAssembler::JumpIfRoot(Register with, RootIndex index,
@@ -569,6 +626,30 @@ inline void MaglevAssembler::CompareInt32AndJumpIf(Register r1, Register r2,
                                                    Label* target,
                                                    Label::Distance distance) {
   CompareAndBranch(r1.W(), r2.W(), cond, target);
+}
+
+inline void MaglevAssembler::CompareInt32AndJumpIf(Register r1, int32_t value,
+                                                   Condition cond,
+                                                   Label* target,
+                                                   Label::Distance distance) {
+  CompareAndBranch(r1.W(), Immediate(value), cond, target);
+}
+
+inline void MaglevAssembler::CompareSmiAndJumpIf(Register r1, Smi value,
+                                                 Condition cond, Label* target,
+                                                 Label::Distance distance) {
+  AssertSmi(r1);
+  CompareAndBranch(r1, Immediate(value), cond, target);
+}
+
+inline void MaglevAssembler::TestInt32AndJumpIfAnySet(
+    Register r1, int32_t mask, Label* target, Label::Distance distance) {
+  TestAndBranchIfAnySet(r1.W(), mask, target);
+}
+
+inline void MaglevAssembler::TestInt32AndJumpIfAllClear(
+    Register r1, int32_t mask, Label* target, Label::Distance distance) {
+  TestAndBranchIfAllClear(r1.W(), mask, target);
 }
 
 inline void MaglevAssembler::LoadHeapNumberValue(DoubleRegister result,
@@ -618,7 +699,8 @@ inline void MaglevAssembler::MaterialiseValueNode(Register dst,
       return;
     }
     case Opcode::kFloat64Constant: {
-      double double_value = value->Cast<Float64Constant>()->value();
+      double double_value =
+          value->Cast<Float64Constant>()->value().get_scalar();
       MoveHeapNumber(dst, double_value);
       return;
     }

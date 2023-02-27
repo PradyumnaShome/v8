@@ -263,7 +263,7 @@ class ActivationsFinder : public ThreadVisitor {
           // Replace the current pc on the stack with the trampoline.
           // TODO(v8:10026): avoid replacing a signed pointer.
           Address* pc_addr = it.frame()->pc_address();
-          Address new_pc = code.raw_instruction_start() + trampoline_pc;
+          Address new_pc = code.InstructionStart() + trampoline_pc;
           PointerAuthentication::ReplacePC(pc_addr, new_pc, kSystemPointerSize);
         }
       }
@@ -699,7 +699,7 @@ void Deoptimizer::TraceDeoptMarked(Isolate* isolate) {
 void Deoptimizer::DoComputeOutputFrames() {
   // When we call this function, the return address of the previous frame has
   // been removed from the stack by the DeoptimizationEntry builtin, so the
-  // stack is not iterable by the SafeStackFrameIterator.
+  // stack is not iterable by the StackFrameIteratorForProfiler.
 #if V8_TARGET_ARCH_STORES_RETURN_ADDRESS_ON_STACK
   DCHECK_EQ(0, isolate()->isolate_data()->stack_is_iterable());
 #endif
@@ -1913,6 +1913,36 @@ unsigned Deoptimizer::ComputeInputFrameAboveFpFixedSize() const {
   return fixed_size;
 }
 
+namespace {
+
+// Get the actual deopt call PC from the return address of the deopt, which
+// points to immediately after the deopt call).
+//
+// See also the Deoptimizer constructor.
+Address GetDeoptCallPCFromReturnPC(Address return_pc, InstructionStream code) {
+  DCHECK_GT(Deoptimizer::kEagerDeoptExitSize, 0);
+  DCHECK_GT(Deoptimizer::kLazyDeoptExitSize, 0);
+  DeoptimizationData deopt_data =
+      DeoptimizationData::cast(code.deoptimization_data());
+  Address deopt_start =
+      code.instruction_start() + deopt_data.DeoptExitStart().value();
+  int eager_deopt_count = deopt_data.EagerDeoptCount().value();
+  Address lazy_deopt_start =
+      deopt_start + eager_deopt_count * Deoptimizer::kEagerDeoptExitSize;
+  // The deoptimization exits are sorted so that lazy deopt exits appear
+  // after eager deopts.
+  static_assert(static_cast<int>(DeoptimizeKind::kLazy) ==
+                    static_cast<int>(kLastDeoptimizeKind),
+                "lazy deopts are expected to be emitted last");
+  if (return_pc <= lazy_deopt_start) {
+    return return_pc - Deoptimizer::kEagerDeoptExitSize;
+  } else {
+    return return_pc - Deoptimizer::kLazyDeoptExitSize;
+  }
+}
+
+}  // namespace
+
 unsigned Deoptimizer::ComputeInputFrameSize() const {
   // The fp-to-sp delta already takes the context, constant pool pointer and the
   // function into account so we have to avoid double counting them.
@@ -1920,10 +1950,31 @@ unsigned Deoptimizer::ComputeInputFrameSize() const {
   unsigned result = fixed_size_above_fp + fp_to_sp_delta_;
   DCHECK(CodeKindCanDeoptimize(compiled_code_.kind()));
   unsigned stack_slots = compiled_code_.stack_slots();
-  unsigned outgoing_size = 0;
-  CHECK_EQ(fixed_size_above_fp + (stack_slots * kSystemPointerSize) -
-               CommonFrameConstants::kFixedFrameSizeAboveFp + outgoing_size,
-           result);
+  if (compiled_code_.is_maglevved()) {
+    // Maglev code can deopt in deferred code which has spilled registers across
+    // the call. These will be included in the fp_to_sp_delta, but the expected
+    // frame size won't include them, so we need to check for less-equal rather
+    // than equal.
+    CHECK_LE(fixed_size_above_fp + (stack_slots * kSystemPointerSize) -
+                 CommonFrameConstants::kFixedFrameSizeAboveFp,
+             result);
+    // With slow asserts we can check this exactly, by looking up the safepoint.
+    if (v8_flags.enable_slow_asserts) {
+      Address deopt_call_pc = GetDeoptCallPCFromReturnPC(from_, compiled_code_);
+      MaglevSafepointTable table(isolate_, deopt_call_pc, compiled_code_);
+      MaglevSafepointEntry safepoint = table.FindEntry(deopt_call_pc);
+      unsigned extra_spills = safepoint.num_pushed_registers();
+      CHECK_EQ(fixed_size_above_fp + (stack_slots * kSystemPointerSize) -
+                   CommonFrameConstants::kFixedFrameSizeAboveFp +
+                   extra_spills * kSystemPointerSize,
+               result);
+    }
+  } else {
+    unsigned outgoing_size = 0;
+    CHECK_EQ(fixed_size_above_fp + (stack_slots * kSystemPointerSize) -
+                 CommonFrameConstants::kFixedFrameSizeAboveFp + outgoing_size,
+             result);
+  }
   return result;
 }
 

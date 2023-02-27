@@ -275,7 +275,6 @@ void HeapObject::HeapObjectPrint(std::ostream& os) {
     case CONS_ONE_BYTE_STRING_TYPE:
     case EXTERNAL_ONE_BYTE_STRING_TYPE:
     case SLICED_ONE_BYTE_STRING_TYPE:
-    case THIN_ONE_BYTE_STRING_TYPE:
     case UNCACHED_EXTERNAL_STRING_TYPE:
     case UNCACHED_EXTERNAL_ONE_BYTE_STRING_TYPE:
     case SHARED_STRING_TYPE:
@@ -284,8 +283,6 @@ void HeapObject::HeapObjectPrint(std::ostream& os) {
     case SHARED_EXTERNAL_ONE_BYTE_STRING_TYPE:
     case SHARED_UNCACHED_EXTERNAL_STRING_TYPE:
     case SHARED_UNCACHED_EXTERNAL_ONE_BYTE_STRING_TYPE:
-    case SHARED_THIN_STRING_TYPE:
-    case SHARED_THIN_ONE_BYTE_STRING_TYPE:
     case JS_LAST_DUMMY_API_OBJECT_TYPE:
       // TODO(all): Handle these types too.
       os << "UNKNOWN TYPE " << map().instance_type();
@@ -347,7 +344,7 @@ bool JSObject::PrintProperties(std::ostream& os) {
   } else if (IsJSGlobalObject()) {
     PrintDictionaryContents(
         os, JSGlobalObject::cast(*this).global_dictionary(kAcquireLoad));
-  } else if (V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL) {
+  } else if constexpr (V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL) {
     PrintDictionaryContents(os, property_dictionary_swiss());
   } else {
     PrintDictionaryContents(os, property_dictionary());
@@ -920,6 +917,12 @@ void PrintTableContentsGeneric(std::ostream& os, T dict,
   }
 }
 
+void PrintNameDictionaryFlags(std::ostream& os, NameDictionary dict) {
+  if (dict.may_have_interesting_symbols()) {
+    os << "\n - may_have_interesting_symbols";
+  }
+}
+
 // Used for ordered and unordered dictionaries.
 template <typename T>
 void PrintDictionaryContentsFull(std::ostream& os, T dict) {
@@ -1010,6 +1013,7 @@ void EphemeronHashTable::EphemeronHashTablePrint(std::ostream& os) {
 
 void NameDictionary::NameDictionaryPrint(std::ostream& os) {
   PrintHashTableHeader(os, *this, "NameDictionary");
+  PrintNameDictionaryFlags(os, *this);
   PrintDictionaryContentsFull(os, *this);
 }
 
@@ -1541,7 +1545,7 @@ void JSSharedArray::JSSharedArrayPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSSharedArray");
   Isolate* isolate = GetIsolateFromWritableObject(*this);
   os << "\n - isolate: " << isolate;
-  if (isolate->is_shared()) os << " (shared)";
+  if (InSharedWritableHeap()) os << " (shared)";
   JSObjectPrintBody(os, *this);
 }
 
@@ -1549,7 +1553,7 @@ void JSSharedStruct::JSSharedStructPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSSharedStruct");
   Isolate* isolate = GetIsolateFromWritableObject(*this);
   os << "\n - isolate: " << isolate;
-  if (isolate->is_shared()) os << " (shared)";
+  if (InSharedWritableHeap()) os << " (shared)";
   JSObjectPrintBody(os, *this);
 }
 
@@ -1557,7 +1561,7 @@ void JSAtomicsMutex::JSAtomicsMutexPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSAtomicsMutex");
   Isolate* isolate = GetIsolateFromWritableObject(*this);
   os << "\n - isolate: " << isolate;
-  if (isolate->is_shared()) os << " (shared)";
+  if (InSharedWritableHeap()) os << " (shared)";
   os << "\n - state: " << this->state();
   os << "\n - owner_thread_id: " << this->owner_thread_id();
   JSObjectPrintBody(os, *this);
@@ -1567,8 +1571,29 @@ void JSAtomicsCondition::JSAtomicsConditionPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSAtomicsCondition");
   Isolate* isolate = GetIsolateFromWritableObject(*this);
   os << "\n - isolate: " << isolate;
-  if (isolate->is_shared()) os << " (shared)";
+  if (InSharedWritableHeap()) os << " (shared)";
   os << "\n - state: " << this->state();
+  JSObjectPrintBody(os, *this);
+}
+
+void JSIteratorHelper::JSIteratorHelperPrintHeader(std::ostream& os,
+                                                   const char* helper_name) {
+  JSObjectPrintHeader(os, *this, helper_name);
+  os << "\n - underlying.object: " << Brief(underlying_object());
+  os << "\n - underlying.next: " << Brief(underlying_next());
+}
+
+void JSIteratorMapHelper::JSIteratorMapHelperPrint(std::ostream& os) {
+  JSIteratorHelperPrintHeader(os, "JSIteratorMapHelper");
+  os << "\n - mapper: " << Brief(mapper());
+  os << "\n - counter: " << counter();
+  JSObjectPrintBody(os, *this);
+}
+
+void JSIteratorFilterHelper::JSIteratorFilterHelperPrint(std::ostream& os) {
+  JSIteratorHelperPrintHeader(os, "JSIteratorFilterHelper");
+  os << "\n - predicate: " << Brief(predicate());
+  os << "\n - counter: " << counter();
   JSObjectPrintBody(os, *this);
 }
 
@@ -1630,6 +1655,19 @@ void JSArrayIterator::JSArrayIteratorPrint(std::ostream& os) {  // NOLING
 
 void JSDataView::JSDataViewPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, "JSDataView");
+  os << "\n - buffer =" << Brief(buffer());
+  os << "\n - byte_offset: " << byte_offset();
+  os << "\n - byte_length: " << byte_length();
+  if (!buffer().IsJSArrayBuffer()) {
+    os << "\n <invalid buffer>";
+    return;
+  }
+  if (WasDetached()) os << "\n - detached";
+  JSObjectPrintBody(os, *this, !WasDetached());
+}
+
+void JSRabGsabDataView::JSRabGsabDataViewPrint(std::ostream& os) {
+  JSObjectPrintHeader(os, *this, "JSRabGsabDataView");
   os << "\n - buffer =" << Brief(buffer());
   os << "\n - byte_offset: " << byte_offset();
   os << "\n - byte_length: " << byte_length();
@@ -1973,8 +2011,7 @@ void WasmStruct::WasmStructPrint(std::ostream& os) {
       case wasm::kRtt: {
         Tagged_t raw = base::ReadUnalignedValue<Tagged_t>(field_address);
 #if V8_COMPRESS_POINTERS
-        Address obj =
-            V8HeapCompressionScheme::DecompressTaggedPointer(address(), raw);
+        Address obj = V8HeapCompressionScheme::DecompressTagged(address(), raw);
 #else
         Address obj = raw;
 #endif
@@ -2127,7 +2164,7 @@ void WasmInstanceObject::WasmInstanceObjectPrint(std::ostream& os) {
   PRINT_WASM_INSTANCE_FIELD(jump_table_start, to_void_ptr);
   PRINT_WASM_INSTANCE_FIELD(data_segment_starts, Brief);
   PRINT_WASM_INSTANCE_FIELD(data_segment_sizes, Brief);
-  PRINT_WASM_INSTANCE_FIELD(dropped_elem_segments, Brief);
+  PRINT_WASM_INSTANCE_FIELD(element_segments, Brief);
   PRINT_WASM_INSTANCE_FIELD(hook_on_function_call_address, to_void_ptr);
   PRINT_WASM_INSTANCE_FIELD(tiering_budget_array, to_void_ptr);
   PRINT_WASM_INSTANCE_FIELD(break_on_entry, static_cast<int>);
@@ -3000,7 +3037,7 @@ inline i::Object GetObjectFromRaw(void* object) {
   if (RoundDown<i::kPtrComprCageBaseAlignment>(object_ptr) == i::kNullAddress) {
     // Try to decompress pointer.
     i::Isolate* isolate = i::Isolate::Current();
-    object_ptr = i::V8HeapCompressionScheme::DecompressTaggedAny(
+    object_ptr = i::V8HeapCompressionScheme::DecompressTagged(
         isolate, static_cast<i::Tagged_t>(object_ptr));
   }
 #endif

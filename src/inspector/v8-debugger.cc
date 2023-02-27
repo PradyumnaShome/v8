@@ -172,7 +172,13 @@ void V8Debugger::setBreakpointsActive(bool active) {
     UNREACHABLE();
   }
   m_breakpointsActiveCount += active ? 1 : -1;
+  DCHECK_GE(m_breakpointsActiveCount, 0);
   v8::debug::SetBreakPointsActive(m_isolate, m_breakpointsActiveCount);
+}
+
+void V8Debugger::removeBreakpoint(v8::debug::BreakpointId id) {
+  v8::debug::RemoveBreakpoint(m_isolate, id);
+  m_throwingConditionReported.erase(id);
 }
 
 v8::debug::ExceptionBreakState V8Debugger::getPauseOnExceptionsState() {
@@ -681,6 +687,47 @@ bool V8Debugger::ShouldBeSkipped(v8::Local<v8::debug::Script> script, int line,
   return hasAgents && allShouldBeSkipped;
 }
 
+void V8Debugger::BreakpointConditionEvaluated(
+    v8::Local<v8::Context> context, v8::debug::BreakpointId breakpoint_id,
+    bool exception_thrown, v8::Local<v8::Value> exception) {
+  auto it = m_throwingConditionReported.find(breakpoint_id);
+
+  if (!exception_thrown) {
+    // Successful evaluation, clear out the bit: we report exceptions should
+    // this breakpoint throw again.
+    if (it != m_throwingConditionReported.end()) {
+      m_throwingConditionReported.erase(it);
+    }
+    return;
+  }
+
+  CHECK(exception_thrown);
+  if (it != m_throwingConditionReported.end() || exception.IsEmpty()) {
+    // Already reported this breakpoint or no exception to report.
+    return;
+  }
+
+  CHECK(!exception.IsEmpty());
+
+  v8::Local<v8::Message> message =
+      v8::debug::CreateMessageFromException(isolate(), exception);
+  v8::ScriptOrigin origin = message->GetScriptOrigin();
+  String16 url;
+  if (origin.ResourceName()->IsString()) {
+    url = toProtocolString(isolate(), origin.ResourceName().As<v8::String>());
+  }
+  // The message text is prepended to the exception text itself so we don't
+  // need to get it from the v8::Message.
+  StringView messageText;
+  StringView detailedMessage;
+  m_inspector->exceptionThrown(
+      context, messageText, exception, detailedMessage, toStringView(url),
+      message->GetLineNumber(context).FromMaybe(0),
+      message->GetStartColumn() + 1, createStackTrace(message->GetStackTrace()),
+      origin.ScriptId());
+  m_throwingConditionReported.insert(breakpoint_id);
+}
+
 void V8Debugger::AsyncEventOccurred(v8::debug::DebugAsyncActionType type,
                                     int id, bool isBlackboxed) {
   // Async task events from Promises are given misaligned pointers to prevent
@@ -850,6 +897,49 @@ v8::MaybeLocal<v8::Array> V8Debugger::collectionsEntries(
   return wrappedEntries;
 }
 
+v8::MaybeLocal<v8::Array> V8Debugger::privateMethods(
+    v8::Local<v8::Context> context, v8::Local<v8::Value> receiver) {
+  if (!receiver->IsObject()) {
+    return v8::MaybeLocal<v8::Array>();
+  }
+  v8::Isolate* isolate = context->GetIsolate();
+  v8::Local<v8::Array> private_methods;
+  std::vector<v8::Local<v8::Value>> names;
+  std::vector<v8::Local<v8::Value>> values;
+  int filter =
+      static_cast<int>(v8::debug::PrivateMemberFilter::kPrivateMethods);
+  if (!v8::debug::GetPrivateMembers(context, receiver.As<v8::Object>(), filter,
+                                    &names, &values) ||
+      names.size() == 0) {
+    return v8::MaybeLocal<v8::Array>();
+  }
+
+  v8::Local<v8::Array> result = v8::Array::New(isolate);
+  if (!result->SetPrototype(context, v8::Null(isolate)).FromMaybe(false))
+    return v8::MaybeLocal<v8::Array>();
+  for (uint32_t i = 0; i < names.size(); i++) {
+    v8::Local<v8::Value> name = names[i];
+    v8::Local<v8::Value> value = values[i];
+    DCHECK(value->IsFunction());
+    v8::Local<v8::Object> wrapper = v8::Object::New(isolate);
+    if (!wrapper->SetPrototype(context, v8::Null(isolate)).FromMaybe(false))
+      continue;
+    createDataProperty(context, wrapper,
+                       toV8StringInternalized(isolate, "name"), name);
+    createDataProperty(context, wrapper,
+                       toV8StringInternalized(isolate, "value"), value);
+    if (!addInternalObject(context, wrapper,
+                           V8InternalValueType::kPrivateMethod))
+      continue;
+    createDataProperty(context, result, result->Length(), wrapper);
+  }
+
+  if (!addInternalObject(context, result,
+                         V8InternalValueType::kPrivateMethodList))
+    return v8::MaybeLocal<v8::Array>();
+  return result;
+}
+
 v8::MaybeLocal<v8::Array> V8Debugger::internalProperties(
     v8::Local<v8::Context> context, v8::Local<v8::Value> value) {
   v8::Local<v8::Array> properties;
@@ -878,6 +968,13 @@ v8::MaybeLocal<v8::Array> V8Debugger::internalProperties(
                          toV8StringInternalized(m_isolate, "[[Scopes]]"));
       createDataProperty(context, properties, properties->Length(), scopes);
     }
+  }
+  v8::Local<v8::Array> private_methods;
+  if (privateMethods(context, value).ToLocal(&private_methods)) {
+    createDataProperty(context, properties, properties->Length(),
+                       toV8StringInternalized(m_isolate, "[[PrivateMethods]]"));
+    createDataProperty(context, properties, properties->Length(),
+                       private_methods);
   }
   return properties;
 }

@@ -466,22 +466,15 @@ WasmEngine::~WasmEngine() {
 }
 
 bool WasmEngine::SyncValidate(Isolate* isolate, const WasmFeatures& enabled,
-                              ModuleWireBytes bytes,
-                              std::string* error_message) {
+                              ModuleWireBytes bytes) {
   TRACE_EVENT0("v8.wasm", "wasm.SyncValidate");
-  // TODO(titzer): remove dependency on the isolate.
-  if (bytes.start() == nullptr || bytes.length() == 0) {
-    if (error_message) *error_message = "empty module wire bytes";
-    return false;
-  }
+  if (bytes.length() == 0) return false;
+
   auto result = DecodeWasmModule(
       enabled, bytes.module_bytes(), true, kWasmOrigin, isolate->counters(),
       isolate->metrics_recorder(),
       isolate->GetOrRegisterRecorderContextId(isolate->native_context()),
       DecodingMethod::kSync);
-  if (result.failed() && error_message) {
-    *error_message = result.error().message();
-  }
   return result.ok();
 }
 
@@ -1041,8 +1034,8 @@ void WasmEngine::AddIsolate(Isolate* isolate) {
 #if defined(V8_COMPRESS_POINTERS)
   // The null value is not accessible on mksnapshot runs.
   if (isolate->snapshot_available()) {
-    null_tagged_compressed_ = V8HeapCompressionScheme::CompressTagged(
-        isolate->factory()->null_value()->ptr());
+    wasm_null_tagged_compressed_ = V8HeapCompressionScheme::CompressObject(
+        isolate->factory()->wasm_null()->ptr());
   }
 #endif
 
@@ -1197,6 +1190,8 @@ void WasmEngine::LogOutstandingCodesForIsolate(Isolate* isolate) {
 std::shared_ptr<NativeModule> WasmEngine::NewNativeModule(
     Isolate* isolate, const WasmFeatures& enabled,
     std::shared_ptr<const WasmModule> module, size_t code_size_estimate) {
+  TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.wasm.detailed"),
+               "wasm.NewNativeModule");
 #ifdef V8_ENABLE_WASM_GDB_REMOTE_DEBUGGING
   if (v8_flags.wasm_gdb_remote && !gdb_server_) {
     gdb_server_ = gdb_server::GdbServer::Create();

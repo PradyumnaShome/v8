@@ -132,6 +132,7 @@ struct WasmModule;
   V(WasmStringConcat)                    \
   V(WasmStringEqual)                     \
   V(WasmStringIsUSVSequence)             \
+  V(WasmStringAsWtf16)                   \
   V(WasmStringViewWtf16GetCodeUnit)      \
   V(WasmStringViewWtf16Encode)           \
   V(WasmStringViewWtf16Slice)            \
@@ -149,7 +150,9 @@ struct WasmModule;
   V(WasmStringViewIterRewind)            \
   V(WasmStringViewIterSlice)             \
   V(WasmStringCompare)                   \
+  V(WasmStringCompareLiftoff)            \
   V(WasmStringFromCodePoint)             \
+  V(WasmStringHash)                      \
   V(WasmExternInternalize)
 
 // Sorted, disjoint and non-overlapping memory regions. A region is of the

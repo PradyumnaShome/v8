@@ -357,7 +357,7 @@ void LiftoffAssembler::PatchPrepareStackFrame(
   bind(&continuation);
 
   // Now allocate the stack space. Note that this might do more than just
-  // decrementing the SP; consult {TurboAssembler::Claim}.
+  // decrementing the SP; consult {MacroAssembler::Claim}.
   Claim(frame_size, 1);
 
   // Jump back to the start of the function, from {pc_offset()} to
@@ -438,7 +438,7 @@ void LiftoffAssembler::LoadTaggedPointerFromInstance(Register dst,
                                                      Register instance,
                                                      int offset) {
   DCHECK_LE(0, offset);
-  LoadTaggedPointerField(dst, MemOperand{instance, offset});
+  LoadTaggedField(dst, MemOperand{instance, offset});
 }
 
 void LiftoffAssembler::LoadExternalPointer(Register dst, Register instance,
@@ -461,7 +461,7 @@ void LiftoffAssembler::LoadTaggedPointer(Register dst, Register src_addr,
   unsigned shift_amount = !needs_shift ? 0 : COMPRESS_POINTERS_BOOL ? 2 : 3;
   MemOperand src_op = liftoff::GetMemOp(this, &temps, src_addr, offset_reg,
                                         offset_imm, false, shift_amount);
-  LoadTaggedPointerField(dst, src_op);
+  LoadTaggedField(dst, src_op);
 }
 
 void LiftoffAssembler::LoadFullPointer(Register dst, Register src_addr,
@@ -494,16 +494,10 @@ void LiftoffAssembler::StoreTaggedPointer(Register dst_addr,
   if (skip_write_barrier || v8_flags.disable_write_barriers) return;
 
   // The write barrier.
-  Label write_barrier;
   Label exit;
-  CheckPageFlag(dst_addr, MemoryChunk::kPointersFromHereAreInterestingMask, ne,
-                &write_barrier);
-  b(&exit);
-  bind(&write_barrier);
+  CheckPageFlag(dst_addr, MemoryChunk::kPointersFromHereAreInterestingMask,
+                kZero, &exit);
   JumpIfSmi(src.gp(), &exit);
-  if (COMPRESS_POINTERS_BOOL) {
-    DecompressTaggedPointer(src.gp(), src.gp());
-  }
   CheckPageFlag(src.gp(),
                 MemoryChunk::kPointersToHereAreInterestingOrInSharedHeapMask,
                 eq, &exit);
@@ -635,75 +629,182 @@ inline void AtomicBinop(LiftoffAssembler* lasm, Register dst_addr,
   Register actual_addr = liftoff::CalculateActualAddress(
       lasm, dst_addr, offset_reg, offset_imm, temps.AcquireX());
 
-  // Allocate an additional {temp} register to hold the result that should be
-  // stored to memory. Note that {temp} and {store_result} are not allowed to be
-  // the same register.
-  Register temp = temps.AcquireX();
+  if (CpuFeatures::IsSupported(LSE)) {
+    CpuFeatureScope scope(lasm, LSE);
+    switch (op) {
+      case Binop::kAnd:
+        switch (type.value()) {
+          case StoreType::kI64Store8:
+          case StoreType::kI32Store8: {
+            UseScratchRegisterScope temps(lasm);
+            Register temp = temps.AcquireW();
+            __ mvn(temp, value.gp().W());
+            __ ldclralb(temp, result.gp().W(), MemOperand(actual_addr));
+            break;
+          }
+          case StoreType::kI64Store16:
+          case StoreType::kI32Store16: {
+            UseScratchRegisterScope temps(lasm);
+            Register temp = temps.AcquireW();
+            __ mvn(temp, value.gp().W());
+            __ ldclralh(temp, result.gp().W(), MemOperand(actual_addr));
+            break;
+          }
+          case StoreType::kI64Store32:
+          case StoreType::kI32Store: {
+            UseScratchRegisterScope temps(lasm);
+            Register temp = temps.AcquireW();
+            __ mvn(temp, value.gp().W());
+            __ ldclral(temp, result.gp().W(), MemOperand(actual_addr));
+            break;
+          }
+          case StoreType::kI64Store: {
+            UseScratchRegisterScope temps(lasm);
+            Register temp = temps.AcquireX();
+            __ mvn(temp, value.gp());
+            __ ldclral(temp, result.gp(), MemOperand(actual_addr));
+            break;
+          }
+          default:
+            UNREACHABLE();
+        }
+        break;
+      case Binop::kSub:
+        switch (type.value()) {
+          case StoreType::kI64Store8:
+          case StoreType::kI32Store8: {
+            UseScratchRegisterScope temps(lasm);
+            Register temp = temps.AcquireW();
+            __ neg(temp, value.gp().W());
+            __ ldaddalb(temp, result.gp().W(), MemOperand(actual_addr));
+            break;
+          }
+          case StoreType::kI64Store16:
+          case StoreType::kI32Store16: {
+            UseScratchRegisterScope temps(lasm);
+            Register temp = temps.AcquireW();
+            __ neg(temp, value.gp().W());
+            __ ldaddalh(temp, result.gp().W(), MemOperand(actual_addr));
+            break;
+          }
+          case StoreType::kI64Store32:
+          case StoreType::kI32Store: {
+            UseScratchRegisterScope temps(lasm);
+            Register temp = temps.AcquireW();
+            __ neg(temp, value.gp().W());
+            __ ldaddal(temp, result.gp().W(), MemOperand(actual_addr));
+            break;
+          }
+          case StoreType::kI64Store: {
+            UseScratchRegisterScope temps(lasm);
+            Register temp = temps.AcquireX();
+            __ neg(temp, value.gp());
+            __ ldaddal(temp, result.gp(), MemOperand(actual_addr));
+            break;
+          }
+          default:
+            UNREACHABLE();
+        }
+        break;
+#define ATOMIC_BINOP_CASE(op, instr)                                           \
+  case Binop::op:                                                              \
+    switch (type.value()) {                                                    \
+      case StoreType::kI64Store8:                                              \
+      case StoreType::kI32Store8:                                              \
+        __ instr##b(value.gp().W(), result.gp().W(), MemOperand(actual_addr)); \
+        break;                                                                 \
+      case StoreType::kI64Store16:                                             \
+      case StoreType::kI32Store16:                                             \
+        __ instr##h(value.gp().W(), result.gp().W(), MemOperand(actual_addr)); \
+        break;                                                                 \
+      case StoreType::kI64Store32:                                             \
+      case StoreType::kI32Store:                                               \
+        __ instr(value.gp().W(), result.gp().W(), MemOperand(actual_addr));    \
+        break;                                                                 \
+      case StoreType::kI64Store:                                               \
+        __ instr(value.gp(), result.gp(), MemOperand(actual_addr));            \
+        break;                                                                 \
+      default:                                                                 \
+        UNREACHABLE();                                                         \
+    }                                                                          \
+    break;
+        ATOMIC_BINOP_CASE(kAdd, ldaddal)
+        ATOMIC_BINOP_CASE(kOr, ldsetal)
+        ATOMIC_BINOP_CASE(kXor, ldeoral)
+        ATOMIC_BINOP_CASE(kExchange, swpal)
+#undef ATOMIC_BINOP_CASE
+    }
+  } else {
+    // Allocate an additional {temp} register to hold the result that should be
+    // stored to memory. Note that {temp} and {store_result} are not allowed to
+    // be the same register.
+    Register temp = temps.AcquireX();
 
-  Label retry;
-  __ Bind(&retry);
-  switch (type.value()) {
-    case StoreType::kI64Store8:
-    case StoreType::kI32Store8:
-      __ ldaxrb(result.gp().W(), actual_addr);
-      break;
-    case StoreType::kI64Store16:
-    case StoreType::kI32Store16:
-      __ ldaxrh(result.gp().W(), actual_addr);
-      break;
-    case StoreType::kI64Store32:
-    case StoreType::kI32Store:
-      __ ldaxr(result.gp().W(), actual_addr);
-      break;
-    case StoreType::kI64Store:
-      __ ldaxr(result.gp().X(), actual_addr);
-      break;
-    default:
-      UNREACHABLE();
+    Label retry;
+    __ Bind(&retry);
+    switch (type.value()) {
+      case StoreType::kI64Store8:
+      case StoreType::kI32Store8:
+        __ ldaxrb(result.gp().W(), actual_addr);
+        break;
+      case StoreType::kI64Store16:
+      case StoreType::kI32Store16:
+        __ ldaxrh(result.gp().W(), actual_addr);
+        break;
+      case StoreType::kI64Store32:
+      case StoreType::kI32Store:
+        __ ldaxr(result.gp().W(), actual_addr);
+        break;
+      case StoreType::kI64Store:
+        __ ldaxr(result.gp().X(), actual_addr);
+        break;
+      default:
+        UNREACHABLE();
+    }
+
+    switch (op) {
+      case Binop::kAdd:
+        __ add(temp, result.gp(), value.gp());
+        break;
+      case Binop::kSub:
+        __ sub(temp, result.gp(), value.gp());
+        break;
+      case Binop::kAnd:
+        __ and_(temp, result.gp(), value.gp());
+        break;
+      case Binop::kOr:
+        __ orr(temp, result.gp(), value.gp());
+        break;
+      case Binop::kXor:
+        __ eor(temp, result.gp(), value.gp());
+        break;
+      case Binop::kExchange:
+        __ mov(temp, value.gp());
+        break;
+    }
+
+    switch (type.value()) {
+      case StoreType::kI64Store8:
+      case StoreType::kI32Store8:
+        __ stlxrb(store_result.W(), temp.W(), actual_addr);
+        break;
+      case StoreType::kI64Store16:
+      case StoreType::kI32Store16:
+        __ stlxrh(store_result.W(), temp.W(), actual_addr);
+        break;
+      case StoreType::kI64Store32:
+      case StoreType::kI32Store:
+        __ stlxr(store_result.W(), temp.W(), actual_addr);
+        break;
+      case StoreType::kI64Store:
+        __ stlxr(store_result.W(), temp.X(), actual_addr);
+        break;
+      default:
+        UNREACHABLE();
+    }
+
+    __ Cbnz(store_result.W(), &retry);
   }
-
-  switch (op) {
-    case Binop::kAdd:
-      __ add(temp, result.gp(), value.gp());
-      break;
-    case Binop::kSub:
-      __ sub(temp, result.gp(), value.gp());
-      break;
-    case Binop::kAnd:
-      __ and_(temp, result.gp(), value.gp());
-      break;
-    case Binop::kOr:
-      __ orr(temp, result.gp(), value.gp());
-      break;
-    case Binop::kXor:
-      __ eor(temp, result.gp(), value.gp());
-      break;
-    case Binop::kExchange:
-      __ mov(temp, value.gp());
-      break;
-  }
-
-  switch (type.value()) {
-    case StoreType::kI64Store8:
-    case StoreType::kI32Store8:
-      __ stlxrb(store_result.W(), temp.W(), actual_addr);
-      break;
-    case StoreType::kI64Store16:
-    case StoreType::kI32Store16:
-      __ stlxrh(store_result.W(), temp.W(), actual_addr);
-      break;
-    case StoreType::kI64Store32:
-    case StoreType::kI32Store:
-      __ stlxr(store_result.W(), temp.W(), actual_addr);
-      break;
-    case StoreType::kI64Store:
-      __ stlxr(store_result.W(), temp.X(), actual_addr);
-      break;
-    default:
-      UNREACHABLE();
-  }
-
-  __ Cbnz(store_result.W(), &retry);
 }
 
 #undef __
@@ -830,45 +931,80 @@ void LiftoffAssembler::AtomicCompareExchange(
   Register actual_addr = liftoff::CalculateActualAddress(
       this, dst_addr, offset_reg, offset_imm, temps.AcquireX());
 
-  Register store_result = temps.AcquireW();
+  if (CpuFeatures::IsSupported(LSE)) {
+    CpuFeatureScope scope(this, LSE);
+    switch (type.value()) {
+      case StoreType::kI64Store8:
+      case StoreType::kI32Store8:
+        if (result.gp() != expected.gp()) {
+          mov(result.gp().W(), expected.gp().W());
+        }
+        casalb(result.gp().W(), new_value.gp().W(), MemOperand(actual_addr));
+        break;
+      case StoreType::kI64Store16:
+      case StoreType::kI32Store16:
+        if (result.gp() != expected.gp()) {
+          mov(result.gp().W(), expected.gp().W());
+        }
+        casalh(result.gp().W(), new_value.gp().W(), MemOperand(actual_addr));
+        break;
+      case StoreType::kI64Store32:
+      case StoreType::kI32Store:
+        if (result.gp() != expected.gp()) {
+          mov(result.gp().W(), expected.gp().W());
+        }
+        casal(result.gp().W(), new_value.gp().W(), MemOperand(actual_addr));
+        break;
+      case StoreType::kI64Store:
+        if (result.gp() != expected.gp()) {
+          mov(result.gp().X(), expected.gp().X());
+        }
+        casal(result.gp().X(), new_value.gp().X(), MemOperand(actual_addr));
+        break;
+      default:
+        UNREACHABLE();
+    }
+  } else {
+    Register store_result = temps.AcquireW();
 
-  Label retry;
-  Label done;
-  Bind(&retry);
-  switch (type.value()) {
-    case StoreType::kI64Store8:
-    case StoreType::kI32Store8:
-      ldaxrb(result_reg.W(), actual_addr);
-      Cmp(result.gp().W(), Operand(expected.gp().W(), UXTB));
-      B(ne, &done);
-      stlxrb(store_result.W(), new_value.gp().W(), actual_addr);
-      break;
-    case StoreType::kI64Store16:
-    case StoreType::kI32Store16:
-      ldaxrh(result_reg.W(), actual_addr);
-      Cmp(result.gp().W(), Operand(expected.gp().W(), UXTH));
-      B(ne, &done);
-      stlxrh(store_result.W(), new_value.gp().W(), actual_addr);
-      break;
-    case StoreType::kI64Store32:
-    case StoreType::kI32Store:
-      ldaxr(result_reg.W(), actual_addr);
-      Cmp(result.gp().W(), Operand(expected.gp().W(), UXTW));
-      B(ne, &done);
-      stlxr(store_result.W(), new_value.gp().W(), actual_addr);
-      break;
-    case StoreType::kI64Store:
-      ldaxr(result_reg.X(), actual_addr);
-      Cmp(result.gp().X(), Operand(expected.gp().X(), UXTX));
-      B(ne, &done);
-      stlxr(store_result.W(), new_value.gp().X(), actual_addr);
-      break;
-    default:
-      UNREACHABLE();
+    Label retry;
+    Label done;
+    Bind(&retry);
+    switch (type.value()) {
+      case StoreType::kI64Store8:
+      case StoreType::kI32Store8:
+        ldaxrb(result_reg.W(), actual_addr);
+        Cmp(result.gp().W(), Operand(expected.gp().W(), UXTB));
+        B(ne, &done);
+        stlxrb(store_result.W(), new_value.gp().W(), actual_addr);
+        break;
+      case StoreType::kI64Store16:
+      case StoreType::kI32Store16:
+        ldaxrh(result_reg.W(), actual_addr);
+        Cmp(result.gp().W(), Operand(expected.gp().W(), UXTH));
+        B(ne, &done);
+        stlxrh(store_result.W(), new_value.gp().W(), actual_addr);
+        break;
+      case StoreType::kI64Store32:
+      case StoreType::kI32Store:
+        ldaxr(result_reg.W(), actual_addr);
+        Cmp(result.gp().W(), Operand(expected.gp().W(), UXTW));
+        B(ne, &done);
+        stlxr(store_result.W(), new_value.gp().W(), actual_addr);
+        break;
+      case StoreType::kI64Store:
+        ldaxr(result_reg.X(), actual_addr);
+        Cmp(result.gp().X(), Operand(expected.gp().X(), UXTX));
+        B(ne, &done);
+        stlxr(store_result.W(), new_value.gp().X(), actual_addr);
+        break;
+      default:
+        UNREACHABLE();
+    }
+
+    Cbnz(store_result.W(), &retry);
+    Bind(&done);
   }
-
-  Cbnz(store_result.W(), &retry);
-  Bind(&done);
 
   if (result_reg != result.gp()) {
     mov(result.gp(), result_reg);
@@ -3252,7 +3388,7 @@ void LiftoffAssembler::CallTrapCallbackForTesting() {
 }
 
 void LiftoffAssembler::AssertUnreachable(AbortReason reason) {
-  TurboAssembler::AssertUnreachable(reason);
+  MacroAssembler::AssertUnreachable(reason);
 }
 
 void LiftoffAssembler::PushRegisters(LiftoffRegList regs) {

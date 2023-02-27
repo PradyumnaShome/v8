@@ -173,6 +173,7 @@ path. Add it with -I<path> to the command line
 //  V8_TARGET_OS_LINUX
 //  V8_TARGET_OS_MACOS
 //  V8_TARGET_OS_WIN
+//  V8_TARGET_OS_CHROMEOS
 //
 // If not set explicitly, these fall back to corresponding V8_OS_ values.
 
@@ -184,7 +185,8 @@ path. Add it with -I<path> to the command line
   && !defined(V8_TARGET_OS_IOS) \
   && !defined(V8_TARGET_OS_LINUX) \
   && !defined(V8_TARGET_OS_MACOS) \
-  && !defined(V8_TARGET_OS_WIN)
+  && !defined(V8_TARGET_OS_WIN) \
+  && !defined(V8_TARGET_OS_CHROMEOS)
 #  error No known target OS defined.
 # endif
 
@@ -195,7 +197,8 @@ path. Add it with -I<path> to the command line
   || defined(V8_TARGET_OS_IOS) \
   || defined(V8_TARGET_OS_LINUX) \
   || defined(V8_TARGET_OS_MACOS) \
-  || defined(V8_TARGET_OS_WIN)
+  || defined(V8_TARGET_OS_WIN) \
+  || defined(V8_TARGET_OS_CHROMEOS)
 #  error A target OS is defined but V8_HAVE_TARGET_OS is unset.
 # endif
 
@@ -346,12 +349,19 @@ path. Add it with -I<path> to the command line
 # define V8_HAS_ATTRIBUTE_NONNULL (__has_attribute(nonnull))
 # define V8_HAS_ATTRIBUTE_NOINLINE (__has_attribute(noinline))
 # define V8_HAS_ATTRIBUTE_UNUSED (__has_attribute(unused))
-// Support for the "preserve_most" attribute is incomplete on 32-bit, and we see
-// failures in component builds. Thus only use it in 64-bit non-component builds
-// for now.
-#if (defined(_M_X64) || defined(__x86_64__) || defined(__AARCH64EL__) || \
-     defined(_M_ARM64)) /* x64 or arm64 */ \
-     && !defined(COMPONENT_BUILD)
+// Support for the "preserve_most" attribute is limited:
+// - 32-bit platforms do not implement it,
+// - component builds fail because _dl_runtime_resolve clobbers registers,
+// - we see crashes on arm64 on Windows (https://crbug.com/1409934), which can
+//   hopefully be fixed in the future.
+// Additionally, the initial implementation in clang <= 16 overwrote the return
+// register(s) in the epilogue of a preserve_most function, so we only use
+// preserve_most in clang >= 17 (see https://reviews.llvm.org/D143425).
+#if (defined(_M_X64) || defined(__x86_64__)            /* x64 (everywhere) */  \
+     || ((defined(__AARCH64EL__) || defined(_M_ARM64)) /* arm64, but ... */    \
+         && !defined(_WIN32)))                         /* not on windows */    \
+     && !defined(COMPONENT_BUILD)                      /* no component build */\
+     && __clang_major__ >= 17                          /* clang >= 17 */
 # define V8_HAS_ATTRIBUTE_PRESERVE_MOST (__has_attribute(preserve_most))
 #endif
 # define V8_HAS_ATTRIBUTE_VISIBILITY (__has_attribute(visibility))

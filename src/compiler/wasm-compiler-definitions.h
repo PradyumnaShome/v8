@@ -28,6 +28,8 @@ struct WasmTypeCheckConfig {
   const wasm::ValueType to;
 };
 
+enum NullCheckStrategy { kExplicitNullChecks, kTrapHandler };
+
 V8_INLINE std::ostream& operator<<(std::ostream& os,
                                    WasmTypeCheckConfig const& p) {
   return os << p.from.name() << " -> " << p.to.name();
@@ -41,6 +43,8 @@ V8_INLINE bool operator==(const WasmTypeCheckConfig& p1,
                           const WasmTypeCheckConfig& p2) {
   return p1.from == p2.from && p1.to == p2.to;
 }
+
+static constexpr int kCharWidthBailoutSentinel = 3;
 
 }  // namespace compiler
 }  // namespace internal

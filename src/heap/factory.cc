@@ -49,6 +49,7 @@
 #include "src/objects/foreign-inl.h"
 #include "src/objects/instance-type-inl.h"
 #include "src/objects/js-array-buffer-inl.h"
+#include "src/objects/js-array-buffer.h"
 #include "src/objects/js-array-inl.h"
 #include "src/objects/js-atomics-synchronization-inl.h"
 #include "src/objects/js-collection-inl.h"
@@ -62,6 +63,7 @@
 #include "src/objects/megadom-handler-inl.h"
 #include "src/objects/microtask-inl.h"
 #include "src/objects/module-inl.h"
+#include "src/objects/objects.h"
 #include "src/objects/promise-inl.h"
 #include "src/objects/property-descriptor-object-inl.h"
 #include "src/objects/scope-info.h"
@@ -73,7 +75,9 @@
 #include "src/roots/roots.h"
 #include "src/strings/unicode-inl.h"
 #if V8_ENABLE_WEBASSEMBLY
+#include "src/wasm/module-decoder-impl.h"
 #include "src/wasm/module-instantiate.h"
+#include "src/wasm/wasm-opcodes-inl.h"
 #include "src/wasm/wasm-result.h"
 #include "src/wasm/wasm-value.h"
 #endif
@@ -493,8 +497,7 @@ Handle<FeedbackVector> Factory::NewFeedbackVector(
       size, AllocationType::kOld, *feedback_vector_map()));
   DisallowGarbageCollection no_gc;
   vector.set_shared_function_info(*shared);
-  vector.set_maybe_optimized_code(HeapObjectReference::ClearedValue(isolate()),
-                                  kReleaseStore);
+  vector.set_maybe_optimized_code(HeapObjectReference::ClearedValue(isolate()));
   vector.set_length(length);
   vector.set_invocation_count(0);
   vector.set_profiler_ticks(0);
@@ -1828,10 +1831,9 @@ Handle<WasmArray> Factory::NewWasmArrayFromMemory(uint32_t length,
 }
 
 Handle<Object> Factory::NewWasmArrayFromElementSegment(
-    Handle<WasmInstanceObject> instance, const wasm::WasmElemSegment* segment,
+    Handle<WasmInstanceObject> instance, uint32_t segment_index,
     uint32_t start_offset, uint32_t length, Handle<Map> map) {
-  wasm::ValueType element_type = WasmArray::type(*map)->element_type();
-  DCHECK(element_type.is_reference());
+  DCHECK(WasmArray::type(*map)->element_type().is_reference());
   HeapObject raw =
       AllocateRaw(WasmArray::SizeFor(*map, length), AllocationType::kYoung);
   {
@@ -1849,17 +1851,24 @@ Handle<Object> Factory::NewWasmArrayFromElementSegment(
 
   Handle<WasmArray> result = handle(WasmArray::cast(raw), isolate());
 
+  // Lazily initialize the element segment if needed.
   AccountingAllocator allocator;
   Zone zone(&allocator, ZONE_NAME);
-  for (uint32_t i = 0; i < length; i++) {
-    wasm::ValueOrError maybe_element = wasm::EvaluateConstantExpression(
-        &zone, segment->entries[start_offset + i], element_type, isolate(),
-        instance);
-    if (wasm::is_error(maybe_element)) {
-      return handle(Smi::FromEnum(wasm::to_error(maybe_element)), isolate());
-    }
-    result->SetTaggedElement(i, wasm::to_value(maybe_element).to_ref());
+  base::Optional<MessageTemplate> opt_error =
+      wasm::InitializeElementSegment(&zone, isolate(), instance, segment_index);
+  if (opt_error.has_value()) {
+    return handle(Smi::FromEnum(opt_error.value()), isolate());
   }
+
+  Handle<FixedArray> elements =
+      handle(FixedArray::cast(instance->element_segments().get(segment_index)),
+             isolate());
+
+  for (uint32_t i = 0; i < length; i++) {
+    result->SetTaggedElement(
+        i, handle(elements->get(start_offset + i), isolate()));
+  }
+
   return result;
 }
 
@@ -1919,12 +1928,21 @@ Handle<SharedFunctionInfo> Factory::NewSharedFunctionInfoForWasmCapiFunction(
 }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
-Handle<Cell> Factory::NewCell(Handle<Object> value) {
+Handle<Cell> Factory::NewCell(Smi value) {
   static_assert(Cell::kSize <= kMaxRegularHeapObjectSize);
   Cell result = Cell::cast(AllocateRawWithImmortalMap(
       Cell::kSize, AllocationType::kOld, *cell_map()));
   DisallowGarbageCollection no_gc;
-  result.set_value(*value);
+  result.set_value(value, WriteBarrierMode::SKIP_WRITE_BARRIER);
+  return handle(result, isolate());
+}
+
+Handle<Cell> Factory::NewCell() {
+  static_assert(Cell::kSize <= kMaxRegularHeapObjectSize);
+  Cell result = Cell::cast(AllocateRawWithImmortalMap(
+      Cell::kSize, AllocationType::kOld, *cell_map()));
+  result.set_value(read_only_roots().undefined_value(),
+                   WriteBarrierMode::SKIP_WRITE_BARRIER);
   return handle(result, isolate());
 }
 
@@ -2028,6 +2046,7 @@ Handle<Map> Factory::NewMap(InstanceType type, int instance_size,
                             ElementsKind elements_kind, int inobject_properties,
                             AllocationType allocation_type) {
   static_assert(LAST_JS_OBJECT_TYPE == LAST_TYPE);
+  DCHECK(!InstanceTypeChecker::MayHaveMapCheckFastCase(type));
   DCHECK_IMPLIES(InstanceTypeChecker::IsJSObject(type) &&
                      !Map::CanHaveFastTransitionableElementsKind(type),
                  IsDictionaryElementsKind(elements_kind) ||
@@ -2040,7 +2059,7 @@ Handle<Map> Factory::NewMap(InstanceType type, int instance_size,
   DisallowGarbageCollection no_gc;
   Heap* roots = allocation_type == AllocationType::kMap
                     ? isolate()->heap()
-                    : isolate()->shared_heap_isolate()->heap();
+                    : isolate()->shared_space_isolate()->heap();
   result.set_map_after_allocation(ReadOnlyRoots(roots).meta_map(),
                                   SKIP_WRITE_BARRIER);
   return handle(InitializeMap(Map::cast(result), type, instance_size,
@@ -3162,25 +3181,31 @@ Handle<JSTypedArray> Factory::NewJSTypedArray(ExternalArrayType type,
   return typed_array;
 }
 
-Handle<JSDataView> Factory::NewJSDataView(Handle<JSArrayBuffer> buffer,
-                                          size_t byte_offset,
-                                          size_t byte_length,
-                                          bool is_length_tracking) {
+Handle<JSDataViewOrRabGsabDataView> Factory::NewJSDataViewOrRabGsabDataView(
+    Handle<JSArrayBuffer> buffer, size_t byte_offset, size_t byte_length,
+    bool is_length_tracking) {
   CHECK_IMPLIES(is_length_tracking, v8_flags.harmony_rab_gsab);
   if (is_length_tracking) {
     // Security: enforce the invariant that length-tracking DataViews have their
     // byte_length set to 0.
     byte_length = 0;
   }
-  Handle<Map> map(isolate()->native_context()->data_view_fun().initial_map(),
-                  isolate());
-  Handle<JSDataView> obj = Handle<JSDataView>::cast(NewJSArrayBufferView(
-      map, empty_fixed_array(), buffer, byte_offset, byte_length));
+  bool is_backed_by_rab = !buffer->is_shared() && buffer->is_resizable_by_js();
+  Handle<Map> map;
+  if (is_backed_by_rab || is_length_tracking) {
+    map = handle(isolate()->native_context()->js_rab_gsab_data_view_map(),
+                 isolate());
+  } else {
+    map = handle(isolate()->native_context()->data_view_fun().initial_map(),
+                 isolate());
+  }
+  Handle<JSDataViewOrRabGsabDataView> obj =
+      Handle<JSDataViewOrRabGsabDataView>::cast(NewJSArrayBufferView(
+          map, empty_fixed_array(), buffer, byte_offset, byte_length));
   obj->set_data_pointer(
       isolate(), static_cast<uint8_t*>(buffer->backing_store()) + byte_offset);
   obj->set_is_length_tracking(is_length_tracking);
-  obj->set_is_backed_by_rab(!buffer->is_shared() &&
-                            buffer->is_resizable_by_js());
+  obj->set_is_backed_by_rab(is_backed_by_rab);
   return obj;
 }
 

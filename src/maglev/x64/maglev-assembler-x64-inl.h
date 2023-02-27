@@ -38,6 +38,19 @@ constexpr Condition ConditionFor(Operation operation) {
   }
 }
 
+inline ScaleFactor ScaleFactorFromInt(int n) {
+  switch (n) {
+    case 1:
+      return times_1;
+    case 2:
+      return times_2;
+    case 4:
+      return times_4;
+    default:
+      UNREACHABLE();
+  }
+}
+
 class MaglevAssembler::ScratchRegisterScope {
  public:
   explicit ScratchRegisterScope(MaglevAssembler* masm)
@@ -223,6 +236,14 @@ inline void MaglevAssembler::BuildTypedArrayDataPointer(Register data_pointer,
   addq(data_pointer, base);
 }
 
+inline void MaglevAssembler::LoadTaggedFieldByIndex(Register result,
+                                                    Register object,
+                                                    Register index, int scale,
+                                                    int offset) {
+  LoadTaggedField(
+      result, FieldOperand(object, index, ScaleFactorFromInt(scale), offset));
+}
+
 inline void MaglevAssembler::LoadBoundedSizeFromObject(Register result,
                                                        Register object,
                                                        int offset) {
@@ -354,6 +375,10 @@ inline void MaglevAssembler::Move(DoubleRegister dst, double n) {
   MacroAssembler::Move(dst, n);
 }
 
+inline void MaglevAssembler::Move(DoubleRegister dst, Float64 n) {
+  MacroAssembler::Move(dst, n.get_bits());
+}
+
 inline void MaglevAssembler::Move(Register dst, Handle<HeapObject> obj) {
   MacroAssembler::Move(dst, obj);
 }
@@ -361,6 +386,7 @@ inline void MaglevAssembler::Move(Register dst, Handle<HeapObject> obj) {
 inline void MaglevAssembler::SignExtend32To64Bits(Register dst, Register src) {
   movsxlq(dst, src);
 }
+inline void MaglevAssembler::NegateInt32(Register val) { negl(val); }
 
 template <typename NodeT>
 inline void MaglevAssembler::DeoptIfBufferDetached(Register array,
@@ -372,10 +398,10 @@ inline void MaglevAssembler::DeoptIfBufferDetached(Register array,
            ->DependOnArrayBufferDetachingProtector()) {
     // A detached buffer leads to megamorphic feedback, so we won't have a deopt
     // loop if we deopt here.
-    LoadTaggedPointerField(
-        scratch, FieldOperand(array, JSArrayBufferView::kBufferOffset));
-    LoadTaggedPointerField(
-        scratch, FieldOperand(scratch, JSArrayBuffer::kBitFieldOffset));
+    LoadTaggedField(scratch,
+                    FieldOperand(array, JSArrayBufferView::kBufferOffset));
+    LoadTaggedField(scratch,
+                    FieldOperand(scratch, JSArrayBuffer::kBitFieldOffset));
     testl(scratch, Immediate(JSArrayBuffer::WasDetachedBit::kMask));
     EmitEagerDeoptIf(not_zero, DeoptimizeReason::kArrayBufferWasDetached, node);
   }
@@ -383,6 +409,11 @@ inline void MaglevAssembler::DeoptIfBufferDetached(Register array,
 
 inline void MaglevAssembler::LoadByte(Register dst, MemOperand src) {
   movzxbl(dst, src);
+}
+
+inline void MaglevAssembler::IsObjectType(Register heap_object,
+                                          InstanceType type) {
+  MacroAssembler::IsObjectType(heap_object, type, kScratchRegister);
 }
 
 inline void MaglevAssembler::CompareObjectType(Register heap_object,
@@ -405,6 +436,17 @@ inline void MaglevAssembler::CompareObjectTypeRange(Register heap_object,
                        higher_limit);
 }
 
+inline void MaglevAssembler::CompareInstanceTypeRange(
+    Register map, InstanceType lower_limit, InstanceType higher_limit) {
+  CompareInstanceTypeRange(map, kScratchRegister, lower_limit, higher_limit);
+}
+
+inline void MaglevAssembler::CompareInstanceTypeRange(
+    Register map, Register instance_type_out, InstanceType lower_limit,
+    InstanceType higher_limit) {
+  CmpInstanceTypeRange(map, instance_type_out, lower_limit, higher_limit);
+}
+
 inline void MaglevAssembler::CompareTagged(Register reg,
                                            Handle<HeapObject> obj) {
   Cmp(reg, obj);
@@ -416,6 +458,11 @@ inline void MaglevAssembler::CompareInt32(Register reg, int32_t imm) {
 
 inline void MaglevAssembler::CompareInt32(Register src1, Register src2) {
   cmpl(src1, src2);
+}
+
+inline void MaglevAssembler::CallSelf() {
+  DCHECK(code_gen_state()->entry_label()->is_bound());
+  Call(code_gen_state()->entry_label());
 }
 
 inline void MaglevAssembler::Jump(Label* target, Label::Distance distance) {
@@ -457,6 +504,34 @@ void MaglevAssembler::CompareInt32AndJumpIf(Register r1, Register r2,
   JumpIf(cond, target, distance);
 }
 
+inline void MaglevAssembler::CompareInt32AndJumpIf(Register r1, int32_t value,
+                                                   Condition cond,
+                                                   Label* target,
+                                                   Label::Distance distance) {
+  CompareInt32(r1, value);
+  JumpIf(cond, target, distance);
+}
+
+inline void MaglevAssembler::CompareSmiAndJumpIf(Register r1, Smi value,
+                                                 Condition cond, Label* target,
+                                                 Label::Distance distance) {
+  AssertSmi(r1);
+  Cmp(r1, value);
+  JumpIf(cond, target, distance);
+}
+
+inline void MaglevAssembler::TestInt32AndJumpIfAnySet(
+    Register r1, int32_t mask, Label* target, Label::Distance distance) {
+  testl(r1, Immediate(mask));
+  JumpIf(kNotZero, target, distance);
+}
+
+inline void MaglevAssembler::TestInt32AndJumpIfAllClear(
+    Register r1, int32_t mask, Label* target, Label::Distance distance) {
+  testl(r1, Immediate(mask));
+  JumpIf(kZero, target, distance);
+}
+
 inline void MaglevAssembler::LoadHeapNumberValue(DoubleRegister result,
                                                  Register heap_number) {
   Movsd(result, FieldOperand(heap_number, HeapNumber::kValueOffset));
@@ -487,7 +562,8 @@ inline void MaglevAssembler::MaterialiseValueNode(Register dst,
       return;
     }
     case Opcode::kFloat64Constant: {
-      double double_value = value->Cast<Float64Constant>()->value();
+      double double_value =
+          value->Cast<Float64Constant>()->value().get_scalar();
       movq_heap_number(dst, double_value);
       return;
     }

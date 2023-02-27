@@ -371,6 +371,12 @@ declare_args() {
 
   # Make ValueDeserializer crash if the data to deserialize is invalid.
   v8_value_deserializer_hard_fail = false
+
+  # Enable jitless mode, including compile-time optimizations. Note that even
+  # when this is set to 'false', one can run V8 in jitless mode at runtime by
+  # passing the `--jitless` flag; but then you miss out on compile-time
+  # optimizations.
+  v8_jitless = v8_enable_lite_mode
 }
 
 # Derived defaults.
@@ -460,6 +466,10 @@ if (v8_enable_maglev == "") {
 }
 assert(v8_enable_turbofan || !v8_enable_maglev,
        "Maglev is not available when Turbofan is disabled.")
+
+assert(!v8_jitless ||
+           (!v8_enable_maglev && !v8_enable_turbofan && !v8_enable_webassembly),
+       "Maglev, Turbofan and Wasm are not available in jitless mode")
 
 if (v8_builtins_profiling_log_file == "default") {
   v8_builtins_profiling_log_file = ""
@@ -557,7 +567,8 @@ if (v8_enable_static_roots == "") {
 assert(!v8_enable_static_roots ||
            (v8_enable_pointer_compression && v8_enable_shared_ro_heap &&
                 v8_enable_pointer_compression_shared_cage &&
-                v8_enable_webassembly && v8_enable_i18n_support),
+                v8_enable_external_code_space && v8_enable_webassembly &&
+                v8_enable_i18n_support),
        "Trying to enable static roots in a configuration that is not supported")
 
 if (v8_enable_webassembly && !target_is_simulator && v8_current_cpu == "x64") {
@@ -779,6 +790,7 @@ external_v8_defines = [
   "V8_USE_PERFETTO",
   "V8_MAP_PACKING",
   "V8_IS_TSAN",
+  "V8_ENABLE_CONSERVATIVE_STACK_SCANNING",
 ]
 
 enabled_external_v8_defines = []
@@ -817,6 +829,9 @@ if (v8_enable_map_packing) {
 }
 if (is_tsan) {
   enabled_external_v8_defines += [ "V8_IS_TSAN" ]
+}
+if (v8_enable_conservative_stack_scanning) {
+  enabled_external_v8_defines += [ "V8_ENABLE_CONSERVATIVE_STACK_SCANNING" ]
 }
 
 disabled_external_v8_defines = external_v8_defines - enabled_external_v8_defines
@@ -986,9 +1001,6 @@ config("features") {
   if (v8_enable_single_generation) {
     defines += [ "V8_ENABLE_SINGLE_GENERATION" ]
   }
-  if (v8_enable_conservative_stack_scanning) {
-    defines += [ "V8_ENABLE_CONSERVATIVE_STACK_SCANNING" ]
-  }
   if (v8_enable_inner_pointer_resolution_osb) {
     defines += [ "V8_ENABLE_INNER_POINTER_RESOLUTION_OSB" ]
   }
@@ -1054,6 +1066,9 @@ config("features") {
   }
   if (v8_enable_turbofan) {
     defines += [ "V8_ENABLE_TURBOFAN" ]
+  }
+  if (v8_jitless) {
+    defines += [ "V8_JITLESS" ]
   }
   if (v8_enable_swiss_name_dictionary) {
     defines += [ "V8_ENABLE_SWISS_NAME_DICTIONARY" ]
@@ -1299,6 +1314,9 @@ config("toolchain") {
   } else if (target_os == "win") {
     defines += [ "V8_HAVE_TARGET_OS" ]
     defines += [ "V8_TARGET_OS_WIN" ]
+  } else if (target_os == "chromeos") {
+    defines += [ "V8_HAVE_TARGET_OS" ]
+    defines += [ "V8_TARGET_OS_CHROMEOS" ]
   }
 
   # TODO(infra): Support v8_enable_prof on Windows.
@@ -1756,6 +1774,7 @@ torque_files = [
   "src/builtins/internal-coverage.tq",
   "src/builtins/internal.tq",
   "src/builtins/iterator.tq",
+  "src/builtins/iterator-helpers.tq",
   "src/builtins/math.tq",
   "src/builtins/number.tq",
   "src/builtins/object-fromentries.tq",
@@ -1866,6 +1885,7 @@ torque_files = [
   "src/objects/js-collection.tq",
   "src/objects/js-function.tq",
   "src/objects/js-generator.tq",
+  "src/objects/js-iterator-helpers.tq",
   "src/objects/js-objects.tq",
   "src/objects/js-promise.tq",
   "src/objects/js-proxy.tq",
@@ -2202,7 +2222,9 @@ template("run_mksnapshot") {
 
       # Replace this with --warn-about-builtin-profile-data to see the full
       # list of builtins with incompatible profiles.
-      args += [ "--abort-on-bad-builtin-profile-data" ]
+      # TODO(crbug.com/v8/13647): Do not fail for invalid profiles
+      # args += [ "--abort-on-bad-builtin-profile-data" ]
+      args += [ "--warn-about-builtin-profile-data" ]
     }
 
     # This is needed to distinguish between generating code for the simulator
@@ -2351,6 +2373,7 @@ action("v8_dump_build_config") {
     "v8_enable_verify_heap=$v8_enable_verify_heap",
     "v8_enable_verify_predictable=$v8_enable_verify_predictable",
     "v8_enable_webassembly=$v8_enable_webassembly",
+    "v8_jitless=$v8_jitless",
     "v8_target_cpu=\"$v8_target_cpu\"",
   ]
 
@@ -2367,7 +2390,10 @@ action("v8_dump_build_config") {
 #
 
 v8_source_set("v8_snapshot") {
-  visibility = [ ":*" ]  # Targets in this file can depend on this.
+  # Let external targets depend on v8_snapshot.
+  if (v8_use_external_startup_data) {
+    visibility = [ ":*" ]  # Targets in this file can depend on this.
+  }
 
   deps = [
     ":v8_internal_headers",
@@ -2401,9 +2427,6 @@ v8_source_set("v8_snapshot") {
 
     sources += [ "src/snapshot/snapshot-external.cc" ]
   } else {
-    # Also top-level visibility targets can depend on this.
-    visibility += [ "//:gn_visibility" ]
-
     public_deps += [ ":v8_maybe_icu" ]
 
     sources += [ "$target_gen_dir/snapshot.cc" ]
@@ -2444,7 +2467,6 @@ v8_source_set("v8_initializers") {
     "src/builtins/builtins-constructor-gen.h",
     "src/builtins/builtins-constructor.h",
     "src/builtins/builtins-conversion-gen.cc",
-    "src/builtins/builtins-data-view-gen.cc",
     "src/builtins/builtins-data-view-gen.h",
     "src/builtins/builtins-date-gen.cc",
     "src/builtins/builtins-generator-gen.cc",
@@ -2833,6 +2855,7 @@ v8_header_set("v8_internal_headers") {
     "src/codegen/interface-descriptors.h",
     "src/codegen/label.h",
     "src/codegen/machine-type.h",
+    "src/codegen/macro-assembler-base.h",
     "src/codegen/macro-assembler-inl.h",
     "src/codegen/macro-assembler.h",
     "src/codegen/maglev-safepoint-table.h",
@@ -2853,7 +2876,6 @@ v8_header_set("v8_internal_headers") {
     "src/codegen/source-position.h",
     "src/codegen/tick-counter.h",
     "src/codegen/tnode.h",
-    "src/codegen/turbo-assembler.h",
     "src/codegen/unoptimized-compilation-info.h",
     "src/common/assert-scope.h",
     "src/common/checks.h",
@@ -2992,6 +3014,7 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/branch-elimination-reducer.h",
     "src/compiler/turboshaft/dead-code-elimination-reducer.h",
     "src/compiler/turboshaft/decompression-optimization.h",
+    "src/compiler/turboshaft/define-assembler-macros.inc",
     "src/compiler/turboshaft/deopt-data.h",
     "src/compiler/turboshaft/fast-hash.h",
     "src/compiler/turboshaft/graph-builder.h",
@@ -3013,10 +3036,14 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/sidetable.h",
     "src/compiler/turboshaft/simplify-tf-loops.h",
     "src/compiler/turboshaft/snapshot-table.h",
+    "src/compiler/turboshaft/tag-untag-lowering-reducer.h",
+    "src/compiler/turboshaft/type-inference-analysis.h",
     "src/compiler/turboshaft/type-inference-reducer.h",
     "src/compiler/turboshaft/type-parser.h",
     "src/compiler/turboshaft/typed-optimizations-reducer.h",
+    "src/compiler/turboshaft/typer.h",
     "src/compiler/turboshaft/types.h",
+    "src/compiler/turboshaft/undef-assembler.macros.inc",
     "src/compiler/turboshaft/uniform-reducer-adapater.h",
     "src/compiler/turboshaft/utils.h",
     "src/compiler/turboshaft/value-numbering-reducer.h",
@@ -3356,6 +3383,8 @@ v8_header_set("v8_internal_headers") {
     "src/objects/js-function.h",
     "src/objects/js-generator-inl.h",
     "src/objects/js-generator.h",
+    "src/objects/js-iterator-helpers-inl.h",
+    "src/objects/js-iterator-helpers.h",
     "src/objects/js-objects-inl.h",
     "src/objects/js-objects.h",
     "src/objects/js-promise-inl.h",
@@ -3670,6 +3699,7 @@ v8_header_set("v8_internal_headers") {
       "src/maglev/maglev-interpreter-frame-state.h",
       "src/maglev/maglev-ir-inl.h",
       "src/maglev/maglev-ir.h",
+      "src/maglev/maglev-phi-representation-selector.h",
       "src/maglev/maglev-regalloc-data.h",
       "src/maglev/maglev-regalloc.h",
       "src/maglev/maglev-register-frame-array.h",
@@ -4456,6 +4486,7 @@ v8_source_set("v8_turboshaft") {
     "src/compiler/turboshaft/representations.cc",
     "src/compiler/turboshaft/simplify-tf-loops.cc",
     "src/compiler/turboshaft/type-parser.cc",
+    "src/compiler/turboshaft/typer.cc",
     "src/compiler/turboshaft/types.cc",
     "src/compiler/turboshaft/utils.cc",
   ]
@@ -4581,6 +4612,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/codegen/handler-table.cc",
     "src/codegen/interface-descriptors.cc",
     "src/codegen/machine-type.cc",
+    "src/codegen/macro-assembler-base.cc",
     "src/codegen/maglev-safepoint-table.cc",
     "src/codegen/optimized-compilation-info.cc",
     "src/codegen/pending-optimization-table.cc",
@@ -4591,7 +4623,6 @@ v8_source_set("v8_base_without_compiler") {
     "src/codegen/source-position.cc",
     "src/codegen/tick-counter.cc",
     "src/codegen/tnode.cc",
-    "src/codegen/turbo-assembler.cc",
     "src/codegen/unoptimized-compilation-info.cc",
     "src/common/assert-scope.cc",
     "src/common/code-memory-access.cc",
@@ -4977,6 +5008,7 @@ v8_source_set("v8_base_without_compiler") {
       "src/maglev/maglev-graph-printer.cc",
       "src/maglev/maglev-interpreter-frame-state.cc",
       "src/maglev/maglev-ir.cc",
+      "src/maglev/maglev-phi-representation-selector.cc",
       "src/maglev/maglev-regalloc.cc",
       "src/maglev/maglev.cc",
     ]
@@ -5163,7 +5195,7 @@ v8_source_set("v8_base_without_compiler") {
     if (v8_enable_webassembly) {
       # Trap handling is enabled on arm64 Mac and in simulators on x64 on Linux,
       # Mac, and Windows.
-      if ((current_cpu == "arm64" && is_mac) ||
+      if ((current_cpu == "arm64" && is_apple) ||
           (current_cpu == "x64" && (is_linux || is_chromeos || is_mac))) {
         sources += [
           "src/trap-handler/handler-inside-posix.cc",
@@ -5727,7 +5759,6 @@ v8_component("v8_libbase") {
         sources += [
           "src/base/debug/stack_trace_posix.cc",
           "src/base/platform/platform-darwin.cc",
-          "src/base/platform/platform-macos.cc",
         ]
       } else {
         sources += [
@@ -5755,12 +5786,12 @@ v8_component("v8_libbase") {
     sources += [
       "src/base/debug/stack_trace_posix.cc",
       "src/base/platform/platform-darwin.cc",
-      "src/base/platform/platform-macos.cc",
     ]
   } else if (is_ios) {
     sources += [
       "src/base/debug/stack_trace_posix.cc",
       "src/base/platform/platform-darwin.cc",
+      "src/base/platform/platform-ios.cc",
     ]
   } else if (is_win) {
     # TODO(infra): Add support for cygwin.

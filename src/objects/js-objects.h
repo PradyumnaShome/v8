@@ -333,6 +333,10 @@ class JSObject : public TorqueGeneratedJSObject<JSObject, JSReceiver> {
       Handle<JSFunction> constructor, Handle<JSReceiver> new_target,
       Handle<AllocationSite> site);
 
+  static MaybeHandle<JSObject> NewWithMap(Isolate* isolate,
+                                          Handle<Map> initial_map,
+                                          Handle<AllocationSite> site);
+
   // 9.1.12 ObjectCreate ( proto [ , internalSlotsList ] )
   // Notice: This is NOT 19.1.2.2 Object.create ( O, Properties )
   static V8_WARN_UNUSED_RESULT MaybeHandle<JSObject> ObjectCreate(
@@ -1110,8 +1114,8 @@ class JSDate : public TorqueGeneratedJSDate<JSDate, JSObject> {
   static V8_WARN_UNUSED_RESULT MaybeHandle<JSDate> New(
       Handle<JSFunction> constructor, Handle<JSReceiver> new_target, double tv);
 
-  // Returns the time value (UTC) identifying the current time.
-  static double CurrentTimeValue(Isolate* isolate);
+  // Returns the time value (UTC) identifying the current time in milliseconds.
+  static int64_t CurrentTimeValue(Isolate* isolate);
 
   // Returns the date field with the specified index.
   // See FieldIndex for the list of date fields.

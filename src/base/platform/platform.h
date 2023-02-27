@@ -316,7 +316,7 @@ class V8_BASE_EXPORT OS {
   // Whether the platform supports mapping a given address in another location
   // in the address space.
   V8_WARN_UNUSED_RESULT static constexpr bool IsRemapPageSupported() {
-#if (defined(V8_OS_MACOS) || defined(V8_OS_LINUX)) && \
+#if (defined(V8_OS_DARWIN) || defined(V8_OS_LINUX)) && \
     !(defined(V8_TARGET_ARCH_PPC64) || defined(V8_TARGET_ARCH_S390X))
     return true;
 #else
@@ -661,6 +661,10 @@ class V8_BASE_EXPORT Stack {
     return slot;
   }
 };
+
+#if V8_HAS_PTHREAD_JIT_WRITE_PROTECT
+V8_BASE_EXPORT void SetJitWriteProtected(int enable);
+#endif
 
 }  // namespace base
 }  // namespace v8

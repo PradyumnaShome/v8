@@ -198,7 +198,7 @@ RUNTIME_FUNCTION(Runtime_DeoptimizeNow) {
   Handle<JSFunction> function;
 
   // Find the JavaScript function on the top of the stack.
-  JavaScriptFrameIterator it(isolate);
+  JavaScriptStackFrameIterator it(isolate);
   if (!it.done()) function = handle(it.frame()->function(), isolate);
   if (function.is_null()) return CrashUnlessFuzzing(isolate);
 
@@ -396,7 +396,7 @@ RUNTIME_FUNCTION(Runtime_CompileBaseline) {
     return CrashUnlessFuzzing(isolate);
   }
 
-  return *function;
+  return ReadOnlyRoots(isolate).undefined_value();
 }
 
 // TODO(v8:7700): Remove this function once we no longer need it to measure
@@ -477,7 +477,7 @@ RUNTIME_FUNCTION(Runtime_IsTurbofanEnabled) {
 RUNTIME_FUNCTION(Runtime_CurrentFrameIsTurbofan) {
   HandleScope scope(isolate);
   DCHECK_EQ(args.length(), 0);
-  JavaScriptFrameIterator it(isolate);
+  JavaScriptStackFrameIterator it(isolate);
   return isolate->heap()->ToBoolean(it.frame()->is_turbofan());
 }
 
@@ -605,7 +605,7 @@ RUNTIME_FUNCTION(Runtime_OptimizeOsr) {
   }
 
   // Find the JavaScript function on the top of the stack.
-  JavaScriptFrameIterator it(isolate);
+  JavaScriptStackFrameIterator it(isolate);
   while (!it.done() && stack_depth--) it.Advance();
   if (!it.done()) function = handle(it.frame()->function(), isolate);
   if (function.is_null()) return CrashUnlessFuzzing(isolate);
@@ -703,7 +703,7 @@ RUNTIME_FUNCTION(Runtime_BaselineOsr) {
   DCHECK_EQ(0, args.length());
 
   // Find the JavaScript function on the top of the stack.
-  JavaScriptFrameIterator it(isolate);
+  JavaScriptStackFrameIterator it(isolate);
   Handle<JSFunction> function = handle(it.frame()->function(), isolate);
   if (function.is_null()) return CrashUnlessFuzzing(isolate);
   if (!v8_flags.sparkplug || !v8_flags.use_osr) {
@@ -819,7 +819,7 @@ RUNTIME_FUNCTION(Runtime_GetOptimizationStatus) {
   // Additionally, detect activations of this frame on the stack, and report the
   // status of the topmost frame.
   JavaScriptFrame* frame = nullptr;
-  JavaScriptFrameIterator it(isolate);
+  JavaScriptStackFrameIterator it(isolate);
   while (!it.done()) {
     if (it.frame()->function() == *function) {
       frame = it.frame();
@@ -1487,7 +1487,7 @@ namespace {
 
 int StackSize(Isolate* isolate) {
   int n = 0;
-  for (JavaScriptFrameIterator it(isolate); !it.done(); it.Advance()) n++;
+  for (JavaScriptStackFrameIterator it(isolate); !it.done(); it.Advance()) n++;
   return n;
 }
 

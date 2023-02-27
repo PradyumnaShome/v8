@@ -333,12 +333,9 @@ class V8_EXPORT Isolate {
         const DisallowJavascriptExecutionScope&) = delete;
 
    private:
-    OnFailure on_failure_;
-    v8::Isolate* v8_isolate_;
-
-    bool was_execution_allowed_assert_;
-    bool was_execution_allowed_throws_;
-    bool was_execution_allowed_dump_;
+    v8::Isolate* const v8_isolate_;
+    const OnFailure on_failure_;
+    bool was_execution_allowed_;
   };
 
   /**
@@ -356,7 +353,7 @@ class V8_EXPORT Isolate {
         const AllowJavascriptExecutionScope&) = delete;
 
    private:
-    Isolate* v8_isolate_;
+    Isolate* const v8_isolate_;
     bool was_execution_allowed_assert_;
     bool was_execution_allowed_throws_;
     bool was_execution_allowed_dump_;
@@ -538,6 +535,7 @@ class V8_EXPORT Isolate {
     kAsyncStackTaggingCreateTaskCall = 116,
     kDurationFormat = 117,
     kInvalidatedNumberStringPrototypeNoReplaceProtector = 118,
+    kRegExpUnicodeSetIncompatibilitiesWithUnicodeMode = 119,
 
     // If you add new values here, you'll also need to update Chromium's:
     // web_feature.mojom, use_counter_callback.cc, and enums.xml. V8 changes to
@@ -1675,7 +1673,11 @@ uint32_t Isolate::GetNumberOfDataSlots() {
 
 template <class T>
 MaybeLocal<T> Isolate::GetDataFromSnapshotOnce(size_t index) {
+#if V8_ENABLE_CONSERVATIVE_STACK_SCANNING
+  T* data = *reinterpret_cast<T**>(GetDataFromSnapshotOnce(index));
+#else
   T* data = reinterpret_cast<T*>(GetDataFromSnapshotOnce(index));
+#endif
   if (data) internal::PerformCastCheck(data);
   return Local<T>(data);
 }

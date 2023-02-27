@@ -1489,6 +1489,29 @@ void AccessorAssembler::HandleStoreICTransitionMapHandlerCase(
                                     p->value(), miss, true);
 }
 
+void AccessorAssembler::UpdateMayHaveInterestingSymbol(
+    TNode<PropertyDictionary> dict, TNode<Name> name) {
+  Comment("UpdateMayHaveInterestingSymbol");
+  Label done(this);
+
+  if constexpr (V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL) {
+    // TODO(pthier): Add flags to swiss dictionaries.
+    Goto(&done);
+  } else {
+    GotoIfNot(IsSymbol(name), &done);
+    TNode<Uint32T> symbol_flags =
+        LoadObjectField<Uint32T>(name, Symbol::kFlagsOffset);
+    GotoIfNot(IsSetWord32<Symbol::IsInterestingSymbolBit>(symbol_flags), &done);
+    TNode<Smi> flags = GetNameDictionaryFlags(dict);
+    flags = SmiOr(
+        flags, SmiConstant(
+                   NameDictionary::MayHaveInterestingSymbolsBit::encode(true)));
+    SetNameDictionaryFlags(dict, flags);
+    Goto(&done);
+  }
+  BIND(&done);
+}
+
 void AccessorAssembler::CheckFieldType(TNode<DescriptorArray> descriptors,
                                        TNode<IntPtrT> name_index,
                                        TNode<Word32T> representation,
@@ -1898,7 +1921,9 @@ void AccessorAssembler::HandleStoreICProtoHandler(
 
       TNode<PropertyDictionary> properties =
           CAST(LoadSlowProperties(CAST(p->receiver())));
-      Add<PropertyDictionary>(properties, CAST(p->name()), p->value(), &slow);
+      TNode<Name> name = CAST(p->name());
+      Add<PropertyDictionary>(properties, name, p->value(), &slow);
+      UpdateMayHaveInterestingSymbol(properties, name);
       Return(p->value());
 
       BIND(&slow);
@@ -2881,7 +2906,7 @@ TNode<IntPtrT> AccessorAssembler::StubCachePrimaryOffset(TNode<Name> name,
   TNode<IntPtrT> map_word = BitcastTaggedToWord(map);
 
   TNode<Int32T> map32 = TruncateIntPtrToInt32(UncheckedCast<IntPtrT>(
-      WordXor(map_word, WordShr(map_word, StubCache::kMapKeyShift))));
+      WordXor(map_word, WordShr(map_word, StubCache::kPrimaryTableBits))));
   // Base the offset on a simple combination of name and map.
   TNode<Word32T> hash = Int32Add(raw_hash_field, map32);
   uint32_t mask = (StubCache::kPrimaryTableSize - 1)
@@ -2900,7 +2925,7 @@ TNode<IntPtrT> AccessorAssembler::StubCacheSecondaryOffset(TNode<Name> name,
   TNode<Int32T> map32 = TruncateIntPtrToInt32(BitcastTaggedToWord(map));
   // Base the offset on a simple combination of name and map.
   TNode<Word32T> hash_a = Int32Add(map32, name32);
-  TNode<Word32T> hash_b = Word32Shr(hash_a, StubCache::kSecondaryKeyShift);
+  TNode<Word32T> hash_b = Word32Shr(hash_a, StubCache::kSecondaryTableBits);
   TNode<Word32T> hash = Int32Add(hash_a, hash_b);
   int32_t mask = (StubCache::kSecondaryTableSize - 1)
                  << StubCache::kCacheIndexShift;
@@ -4469,6 +4494,16 @@ void AccessorAssembler::LookupGlobalIC(
                                         ? Runtime::kLoadLookupSlotInsideTypeof
                                         : Runtime::kLoadLookupSlot;
   TailCallRuntime(function_id, context, lazy_name());
+}
+
+void AccessorAssembler::GenerateLookupGlobalIC(TypeofMode typeof_mode) {
+  using Descriptor = LookupWithVectorDescriptor;
+  LookupGlobalIC([&] { return Parameter<Object>(Descriptor::kName); },
+                 Parameter<TaggedIndex>(Descriptor::kDepth),
+                 [&] { return Parameter<TaggedIndex>(Descriptor::kSlot); },
+                 Parameter<Context>(Descriptor::kContext),
+                 [&] { return Parameter<FeedbackVector>(Descriptor::kVector); },
+                 typeof_mode);
 }
 
 void AccessorAssembler::GenerateLookupGlobalICTrampoline(

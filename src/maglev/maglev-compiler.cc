@@ -38,6 +38,7 @@
 #include "src/maglev/maglev-interpreter-frame-state.h"
 #include "src/maglev/maglev-ir-inl.h"
 #include "src/maglev/maglev-ir.h"
+#include "src/maglev/maglev-phi-representation-selector.h"
 #include "src/maglev/maglev-regalloc-data.h"
 #include "src/maglev/maglev-regalloc.h"
 #include "src/objects/code-inl.h"
@@ -141,7 +142,7 @@ class UseMarkingProcessor {
   explicit UseMarkingProcessor(MaglevCompilationInfo* compilation_info)
       : compilation_info_(compilation_info) {}
 
-  void PreProcessGraph(Graph* graph) { next_node_id_ = kFirstValidNodeId; }
+  void PreProcessGraph(Graph* graph) {}
   void PostProcessGraph(Graph* graph) { DCHECK(loop_used_nodes_.empty()); }
   void PreProcessBasicBlock(BasicBlock* block) {
     if (!block->has_state()) return;
@@ -338,13 +339,14 @@ class UseMarkingProcessor {
   }
 
   MaglevCompilationInfo* compilation_info_;
-  uint32_t next_node_id_;
+  uint32_t next_node_id_ = kFirstValidNodeId;
   std::vector<LoopUsedNodes> loop_used_nodes_;
 };
 
 // static
 bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
                              MaglevCompilationInfo* compilation_info) {
+  compiler::CurrentHeapBrokerScope current_broker(compilation_info->broker());
   Graph* graph = Graph::New(compilation_info->zone());
 
   // Build graph.
@@ -378,6 +380,17 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
       std::cout << "\nAfter graph buiding" << std::endl;
       PrintGraph(std::cout, compilation_info, graph);
     }
+
+    // TODO(dmercadier): re-enable Phi untagging.
+
+    // GraphProcessor<MaglevPhiRepresentationSelector> representation_selector(
+    //     &graph_builder);
+    // representation_selector.ProcessGraph(graph);
+
+    // if (v8_flags.print_maglev_graph) {
+    //   std::cout << "\nAfter Phi untagging" << std::endl;
+    //   PrintGraph(std::cout, compilation_info, graph);
+    // }
   }
 
 #ifdef DEBUG
@@ -429,6 +442,7 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
 // static
 MaybeHandle<Code> MaglevCompiler::GenerateCode(
     Isolate* isolate, MaglevCompilationInfo* compilation_info) {
+  compiler::CurrentHeapBrokerScope current_broker(compilation_info->broker());
   MaglevCodeGenerator* const code_generator =
       compilation_info->code_generator();
   DCHECK_NOT_NULL(code_generator);

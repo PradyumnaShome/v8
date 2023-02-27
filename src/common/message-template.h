@@ -29,7 +29,7 @@ namespace internal {
   T(IcuError, "Internal error. Icu error.")                                    \
   /* TypeError */                                                              \
   T(ApplyNonFunction,                                                          \
-    "Function.prototype.apply was called on %, which is a % and not a "        \
+    "Function.prototype.apply was called on %, which is % and not a "          \
     "function")                                                                \
   T(ArgumentsDisallowedInInitializerAndStaticBlock,                            \
     "'arguments' is not allowed in class field initializer or static "         \
@@ -543,7 +543,7 @@ namespace internal {
     "Labelled function declaration not allowed as the body of a control flow " \
     "structure")                                                               \
   T(MalformedArrowFunParamList, "Malformed arrow function parameter list")     \
-  T(MalformedRegExp, "Invalid regular expression: /%/: %")                     \
+  T(MalformedRegExp, "Invalid regular expression: /%/%: %")                    \
   T(MalformedRegExpFlags, "Invalid regular expression flags")                  \
   T(ModuleExportUndefined, "Export '%' is not defined in module")              \
   T(MissingFunctionName, "Function statements require a function name")        \
@@ -711,7 +711,10 @@ namespace internal {
   T(OptionalChainingNoSuper, "Invalid optional chain from super property")     \
   T(OptionalChainingNoTemplate, "Invalid tagged template on optional chain")   \
   /* AggregateError */                                                         \
-  T(AllPromisesRejected, "All promises were rejected")
+  T(AllPromisesRejected, "All promises were rejected")                         \
+  T(CannotDeepFreezeObject, "Cannot DeepFreeze object of type %")              \
+  T(CannotDeepFreezeValue, "Cannot DeepFreeze non-const value %")
+
 enum class MessageTemplate {
 #define TEMPLATE(NAME, STRING) k##NAME,
   MESSAGE_TEMPLATES(TEMPLATE)

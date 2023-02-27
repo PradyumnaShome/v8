@@ -1481,21 +1481,33 @@ void InstructionSelector::VisitBitcastWord32ToWord64(Node* node) {
 }
 
 void InstructionSelector::VisitChangeInt32ToInt64(Node* node) {
-  // On MIPS64, int32 values should all be sign-extended to 64-bit, so
-  // no need to sign-extend them here.
-  // But when call to a host function in simulator, if the function return an
-  // int32 value, the simulator do not sign-extend to int64, because in
-  // simulator we do not know the function whether return an int32 or int64.
-#ifdef USE_SIMULATOR
   Node* value = node->InputAt(0);
-  if (value->opcode() == IrOpcode::kCall) {
+  if ((value->opcode() == IrOpcode::kLoad ||
+       value->opcode() == IrOpcode::kLoadImmutable) &&
+      CanCover(node, value)) {
+    // Generate sign-extending load.
+    LoadRepresentation load_rep = LoadRepresentationOf(value->op());
+    InstructionCode opcode = kArchNop;
+    switch (load_rep.representation()) {
+      case MachineRepresentation::kBit:  // Fall through.
+      case MachineRepresentation::kWord8:
+        opcode = load_rep.IsUnsigned() ? kMips64Lbu : kMips64Lb;
+        break;
+      case MachineRepresentation::kWord16:
+        opcode = load_rep.IsUnsigned() ? kMips64Lhu : kMips64Lh;
+        break;
+      case MachineRepresentation::kWord32:
+        opcode = kMips64Lw;
+        break;
+      default:
+        UNREACHABLE();
+    }
+    EmitLoad(this, value, opcode, node);
+  } else {
     Mips64OperandGenerator g(this);
     Emit(kMips64Shl, g.DefineAsRegister(node), g.UseRegister(value),
          g.TempImmediate(0));
-    return;
   }
-#endif
-  EmitIdentity(node);
 }
 
 bool InstructionSelector::ZeroExtendsWord32ToWord64NoPhis(Node* node) {
@@ -3205,6 +3217,21 @@ SIMD_RELAXED_OP_LIST(SIMD_VISIT_RELAXED_OP)
 void InstructionSelector::VisitS128Select(Node* node) {
   VisitRRRR(this, kMips64S128Select, node);
 }
+
+#define SIMD_UNIMP_OP_LIST(V) \
+  V(F64x2Qfma)                \
+  V(F64x2Qfms)                \
+  V(F32x4Qfma)                \
+  V(F32x4Qfms)                \
+  V(I16x8DotI8x16I7x16S)      \
+  V(I32x4DotI8x16I7x16AddS)
+
+#define SIMD_VISIT_UNIMP_OP(Name) \
+  void InstructionSelector::Visit##Name(Node* node) { UNIMPLEMENTED(); }
+SIMD_UNIMP_OP_LIST(SIMD_VISIT_UNIMP_OP)
+
+#undef SIMD_VISIT_UNIMP_OP
+#undef SIMD_UNIMP_OP_LIST
 
 #if V8_ENABLE_WEBASSEMBLY
 namespace {

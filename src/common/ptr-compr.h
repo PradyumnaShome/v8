@@ -24,20 +24,20 @@ class V8HeapCompressionScheme {
 
   // Compresses full-pointer representation of a tagged value to on-heap
   // representation.
-  V8_INLINE static Tagged_t CompressTagged(Address tagged);
+  // Must only be used for compressing object pointers since this function
+  // assumes that we deal with a valid address inside the pointer compression
+  // cage.
+  V8_INLINE static Tagged_t CompressObject(Address tagged);
+  // Compress a potentially invalid pointer.
+  V8_INLINE static Tagged_t CompressAny(Address tagged);
 
   // Decompresses smi value.
   V8_INLINE static Address DecompressTaggedSigned(Tagged_t raw_value);
 
-  // Decompresses weak or strong heap object pointer or forwarding pointer,
-  // preserving both weak- and smi- tags.
-  template <typename TOnHeapAddress>
-  V8_INLINE static Address DecompressTaggedPointer(TOnHeapAddress on_heap_addr,
-                                                   Tagged_t raw_value);
   // Decompresses any tagged value, preserving both weak- and smi- tags.
   template <typename TOnHeapAddress>
-  V8_INLINE static Address DecompressTaggedAny(TOnHeapAddress on_heap_addr,
-                                               Tagged_t raw_value);
+  V8_INLINE static Address DecompressTagged(TOnHeapAddress on_heap_addr,
+                                            Tagged_t raw_value);
 
   // Given a 64bit raw value, found on the stack, calls the callback function
   // with all possible pointers that may be "contained" in compressed form in
@@ -77,20 +77,20 @@ class ExternalCodeCompressionScheme {
 
   // Compresses full-pointer representation of a tagged value to on-heap
   // representation.
-  V8_INLINE static Tagged_t CompressTagged(Address tagged);
+  // Must only be used for compressing object pointers (incl. SMI) since this
+  // function assumes pointers to be inside the pointer compression cage.
+  V8_INLINE static Tagged_t CompressObject(Address tagged);
+  // Compress anything that does not follow the above requirements (e.g. a maybe
+  // object, or a marker bit pattern).
+  V8_INLINE static Tagged_t CompressAny(Address tagged);
 
   // Decompresses smi value.
   V8_INLINE static Address DecompressTaggedSigned(Tagged_t raw_value);
 
-  // Decompresses weak or strong heap object pointer or forwarding pointer,
-  // preserving both weak- and smi- tags.
-  template <typename TOnHeapAddress>
-  V8_INLINE static Address DecompressTaggedPointer(TOnHeapAddress on_heap_addr,
-                                                   Tagged_t raw_value);
   // Decompresses any tagged value, preserving both weak- and smi- tags.
   template <typename TOnHeapAddress>
-  V8_INLINE static Address DecompressTaggedAny(TOnHeapAddress on_heap_addr,
-                                               Tagged_t raw_value);
+  V8_INLINE static Address DecompressTagged(TOnHeapAddress on_heap_addr,
+                                            Tagged_t raw_value);
 
 #ifdef V8_COMPRESS_POINTERS_IN_SHARED_CAGE
   // Process-wide cage base value used for decompression.

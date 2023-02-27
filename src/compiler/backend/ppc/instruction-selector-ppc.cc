@@ -214,10 +214,10 @@ static void VisitLoadCommon(InstructionSelector* selector, Node* node,
       opcode = kPPC_LoadDecompressTaggedSigned;
       break;
     case MachineRepresentation::kTaggedPointer:
-      opcode = kPPC_LoadDecompressTaggedPointer;
+      opcode = kPPC_LoadDecompressTagged;
       break;
     case MachineRepresentation::kTagged:
-      opcode = kPPC_LoadDecompressAnyTagged;
+      opcode = kPPC_LoadDecompressTagged;
       break;
 #else
     case MachineRepresentation::kTaggedSigned:   // Fall through.
@@ -2611,6 +2611,21 @@ void InstructionSelector::VisitS128Const(Node* node) {
          g.UseImmediate(Pack4Lanes(base::bit_cast<uint8_t*>(&val[0]) + 8)),
          g.UseImmediate(Pack4Lanes(base::bit_cast<uint8_t*>(&val[0]) + 12)));
   }
+}
+
+void InstructionSelector::VisitI16x8DotI8x16I7x16S(Node* node) {
+  PPCOperandGenerator g(this);
+  Emit(kPPC_I16x8DotI8x16S, g.DefineAsRegister(node),
+       g.UseUniqueRegister(node->InputAt(0)),
+       g.UseUniqueRegister(node->InputAt(1)));
+}
+
+void InstructionSelector::VisitI32x4DotI8x16I7x16AddS(Node* node) {
+  PPCOperandGenerator g(this);
+  Emit(kPPC_I32x4DotI8x16AddS, g.DefineAsRegister(node),
+       g.UseUniqueRegister(node->InputAt(0)),
+       g.UseUniqueRegister(node->InputAt(1)),
+       g.UseUniqueRegister(node->InputAt(2)));
 }
 
 void InstructionSelector::EmitPrepareResults(

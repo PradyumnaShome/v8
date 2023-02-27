@@ -91,7 +91,7 @@ void ReadOnlySerializer::FinalizeSerialization() {
     auto space = isolate()->read_only_heap()->read_only_space();
     size_t num_pages = space->pages().size();
     sink_.PutInt(num_pages, "num pages");
-    Tagged_t pos = V8HeapCompressionScheme::CompressTagged(
+    Tagged_t pos = V8HeapCompressionScheme::CompressAny(
         reinterpret_cast<Address>(space->pages()[0]));
     sink_.PutInt(pos, "first page offset");
     for (auto p : space->pages()) {
@@ -103,8 +103,19 @@ void ReadOnlySerializer::FinalizeSerialization() {
       __msan_check_mem_is_initialized(reinterpret_cast<void*>(p->area_start()),
                                       static_cast<int>(page_content_bytes));
 #endif
+#if defined(V8_STATIC_ROOTS) && defined(V8_ENABLE_WEBASSEMBLY)
+      // Unprotect and reprotect the payload of wasm null.
+      Address wasm_null_payload = isolate()->factory()->wasm_null()->payload();
+      SetPermissions(isolate()->page_allocator(), wasm_null_payload,
+                     WasmNull::kSize - kTaggedSize, PageAllocator::kRead);
       sink_.PutRaw(reinterpret_cast<const byte*>(p->area_start()),
                    static_cast<int>(page_content_bytes), "page");
+      SetPermissions(isolate()->page_allocator(), wasm_null_payload,
+                     WasmNull::kSize - kTaggedSize, PageAllocator::kNoAccess);
+#else
+      sink_.PutRaw(reinterpret_cast<const byte*>(p->area_start()),
+                   static_cast<int>(page_content_bytes), "page");
+#endif
     }
   } else {
     // This comes right after serialization of the other snapshots, where we

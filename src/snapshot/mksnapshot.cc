@@ -15,6 +15,7 @@
 #include "src/base/platform/wrappers.h"
 #include "src/base/vector.h"
 #include "src/codegen/cpu-features.h"
+#include "src/common/globals.h"
 #include "src/flags/flags.h"
 #include "src/snapshot/embedded/embedded-file-writer.h"
 #include "src/snapshot/snapshot.h"

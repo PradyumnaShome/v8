@@ -295,7 +295,7 @@ void ReplaceWrapper(Isolate* isolate, Handle<WasmInstanceObject> instance,
           .ToHandleChecked();
   Handle<WasmExternalFunction> exported_function =
       handle(WasmExternalFunction::cast(internal->external()), isolate);
-  exported_function->set_code(*wrapper_code, kReleaseStore);
+  exported_function->set_code(*wrapper_code);
   WasmExportedFunctionData function_data =
       exported_function->shared().wasm_exported_function_data();
   function_data.set_wrapper_code(*wrapper_code);
@@ -793,19 +793,23 @@ RUNTIME_FUNCTION(Runtime_WasmArrayNewSegment) {
         instance->data_segment_starts().get(segment_index) + offset;
     return *isolate->factory()->NewWasmArrayFromMemory(length, rtt, source);
   } else {
-    const wasm::WasmElemSegment* elem_segment =
+    Handle<Object> elem_segment_raw =
+        handle(instance->element_segments().get(segment_index), isolate);
+    const wasm::WasmElemSegment* module_elem_segment =
         &instance->module()->elem_segments[segment_index];
-    if (!base::IsInBounds<size_t>(
-            offset, length,
-            instance->dropped_elem_segments().get(segment_index)
-                ? 0
-                : elem_segment->entries.size())) {
+    // If the segment is initialized in the instance, we have to get its length
+    // from there, as it might have been dropped. If the segment is
+    // uninitialized, we need to fetch its length from the module.
+    int segment_length =
+        elem_segment_raw->IsFixedArray()
+            ? Handle<FixedArray>::cast(elem_segment_raw)->length()
+            : module_elem_segment->element_count;
+    if (!base::IsInBounds<size_t>(offset, length, segment_length)) {
       return ThrowWasmError(
           isolate, MessageTemplate::kWasmTrapElementSegmentOutOfBounds);
     }
-
     Handle<Object> result = isolate->factory()->NewWasmArrayFromElementSegment(
-        instance, elem_segment, offset, length, rtt);
+        instance, segment_index, offset, length, rtt);
     if (result->IsSmi()) {
       return ThrowWasmError(
           isolate, static_cast<MessageTemplate>(result->ToSmi().value()));
@@ -951,7 +955,7 @@ RUNTIME_FUNCTION(Runtime_WasmStringNewWtf8) {
   if (utf8_variant == unibrow::Utf8Variant::kUtf8NoTrap) {
     DCHECK(!isolate->has_pending_exception());
     if (result_string.is_null()) {
-      return *isolate->factory()->null_value();
+      return *isolate->factory()->wasm_null();
     }
     return *result_string.ToHandleChecked();
   }
@@ -976,7 +980,7 @@ RUNTIME_FUNCTION(Runtime_WasmStringNewWtf8Array) {
   if (utf8_variant == unibrow::Utf8Variant::kUtf8NoTrap) {
     DCHECK(!isolate->has_pending_exception());
     if (result_string.is_null()) {
-      return *isolate->factory()->null_value();
+      return *isolate->factory()->wasm_null();
     }
     return *result_string.ToHandleChecked();
   }
@@ -1398,6 +1402,14 @@ RUNTIME_FUNCTION(Runtime_WasmStringFromCodePoint) {
   DisallowGarbageCollection no_gc;
   CopyChars(result->GetChars(no_gc), char_buffer, arraysize(char_buffer));
   return *result;
+}
+
+RUNTIME_FUNCTION(Runtime_WasmStringHash) {
+  ClearThreadInWasmScope flag_scope(isolate);
+  DCHECK_EQ(1, args.length());
+  String string(String::cast(args[0]));
+  uint32_t hash = string.EnsureHash();
+  return Smi::FromInt(static_cast<int>(hash));
 }
 
 }  // namespace internal

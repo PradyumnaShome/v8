@@ -18,6 +18,7 @@
 #include "src/wasm/wasm-import-wrapper-cache.h"
 #include "src/wasm/wasm-objects-inl.h"
 #include "src/wasm/wasm-opcodes.h"
+#include "src/wasm/wasm-subtyping.h"
 
 namespace v8 {
 namespace internal {
@@ -241,10 +242,12 @@ void TestingModuleBuilder::AddIndirectFunctionTable(
 
   WasmInstanceObject::EnsureIndirectFunctionTableWithMinimumSize(
       instance_object(), table_index, table_size);
-  Handle<WasmTableObject> table_obj =
-      WasmTableObject::New(isolate_, instance, table.type, table.initial_size,
-                           table.has_maximum_size, table.maximum_size, nullptr,
-                           isolate_->factory()->null_value());
+  Handle<WasmTableObject> table_obj = WasmTableObject::New(
+      isolate_, instance, table.type, table.initial_size,
+      table.has_maximum_size, table.maximum_size, nullptr,
+      IsSubtypeOf(table.type, kWasmExternRef, test_module_.get())
+          ? Handle<Object>::cast(isolate_->factory()->null_value())
+          : Handle<Object>::cast(isolate_->factory()->wasm_null()));
 
   WasmTableObject::AddDispatchTable(isolate_, table_obj, instance_object_,
                                     table_index);
@@ -352,29 +355,6 @@ uint32_t TestingModuleBuilder::AddPassiveDataSegment(
   return index;
 }
 
-uint32_t TestingModuleBuilder::AddPassiveElementSegment(
-    const std::vector<uint32_t>& entries) {
-  uint32_t index = static_cast<uint32_t>(test_module_->elem_segments.size());
-  DCHECK_EQ(index, dropped_elem_segments_.size());
-
-  test_module_->elem_segments.emplace_back(
-      kWasmFuncRef, WasmElemSegment::kStatusPassive,
-      WasmElemSegment::kFunctionIndexElements);
-  auto& elem_segment = test_module_->elem_segments.back();
-  for (uint32_t entry : entries) {
-    elem_segment.entries.emplace_back(ConstantExpression::RefFunc(entry));
-  }
-
-  // The vector pointers may have moved, so update the instance object.
-  dropped_elem_segments_.push_back(0);
-  uint32_t size = static_cast<uint32_t>(dropped_elem_segments_.size());
-  Handle<FixedUInt8Array> dropped_elem_segments =
-      FixedUInt8Array::New(isolate_, size);
-  dropped_elem_segments->copy_in(0, dropped_elem_segments_.data(), size);
-  instance_object_->set_dropped_elem_segments(*dropped_elem_segments);
-  return index;
-}
-
 CompilationEnv TestingModuleBuilder::CreateCompilationEnv() {
   return {test_module_.get(), native_module_->bounds_checks(),
           runtime_exception_support_, enabled_features_, kNoDynamicTiering};
@@ -425,24 +405,9 @@ void TestBuildingGraphWithBuilder(compiler::WasmGraphBuilder* builder,
   WasmFeatures unused_detected_features;
   FunctionBody body(sig, 0, start, end);
   std::vector<compiler::WasmLoopInfo> loops;
-  DecodeResult result =
-      BuildTFGraph(zone->allocator(), WasmFeatures::All(), nullptr, builder,
-                   &unused_detected_features, body, &loops, nullptr, nullptr, 0,
-                   kRegularFunction);
-  if (result.failed()) {
-#ifdef DEBUG
-    if (!v8_flags.trace_wasm_decoder) {
-      // Retry the compilation with the tracing flag on, to help in debugging.
-      v8_flags.trace_wasm_decoder = true;
-      result = BuildTFGraph(zone->allocator(), WasmFeatures::All(), nullptr,
-                            builder, &unused_detected_features, body, &loops,
-                            nullptr, nullptr, 0, kRegularFunction);
-    }
-#endif
-
-    FATAL("Verification failed; pc = +%x, msg = %s", result.error().offset(),
-          result.error().message().c_str());
-  }
+  BuildTFGraph(zone->allocator(), WasmFeatures::All(), nullptr, builder,
+               &unused_detected_features, body, &loops, nullptr, nullptr, 0,
+               kRegularFunction);
   builder->LowerInt64(compiler::WasmGraphBuilder::kCalledFromWasm);
 }
 

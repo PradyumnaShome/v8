@@ -69,7 +69,6 @@ GCSAFE_CODE_FWD_ACCESSOR(bool, is_turbofanned)
 GCSAFE_CODE_FWD_ACCESSOR(bool, has_tagged_outgoing_params)
 GCSAFE_CODE_FWD_ACCESSOR(bool, marked_for_deoptimization)
 GCSAFE_CODE_FWD_ACCESSOR(Object, raw_instruction_stream)
-GCSAFE_CODE_FWD_ACCESSOR(Address, raw_instruction_start)
 #undef GCSAFE_CODE_FWD_ACCESSOR
 
 int GcSafeCode::GetOffsetFromInstructionStart(Isolate* isolate,
@@ -82,7 +81,10 @@ Address GcSafeCode::InstructionStart(Isolate* isolate, Address pc) const {
 }
 
 Address GcSafeCode::InstructionEnd(Isolate* isolate, Address pc) const {
-  return UnsafeCastToCode().InstructionEnd(isolate, pc);
+  return V8_LIKELY(has_instruction_stream())
+             ? InstructionStream::unchecked_cast(raw_instruction_stream())
+                   .instruction_end()
+             : UnsafeCastToCode().OffHeapInstructionEnd(isolate, pc);
 }
 
 int AbstractCode::InstructionSize(PtrComprCageBase cage_base) {
@@ -462,13 +464,13 @@ Address InstructionStream::metadata_start() const {
 
 Address Code::InstructionStart(Isolate* isolate, Address pc) const {
   return V8_LIKELY(has_instruction_stream())
-             ? raw_instruction_start()
+             ? code_entry_point()
              : OffHeapInstructionStart(isolate, pc);
 }
 
 Address Code::InstructionEnd(Isolate* isolate, Address pc) const {
   return V8_LIKELY(has_instruction_stream())
-             ? raw_instruction_end()
+             ? instruction_stream().instruction_end()
              : OffHeapInstructionEnd(isolate, pc);
 }
 
@@ -704,6 +706,8 @@ uintptr_t InstructionStream::GetBaselinePCForNextExecutedBytecode(
         bytecode_iterator.GetJumpTargetOffset(), bytecodes);
   } else {
     DCHECK(!interpreter::Bytecodes::IsJump(bytecode));
+    DCHECK(!interpreter::Bytecodes::IsSwitch(bytecode));
+    DCHECK(!interpreter::Bytecodes::Returns(bytecode));
     return GetBaselineEndPCForBytecodeOffset(bytecode_offset, bytecodes);
   }
 }
@@ -1103,6 +1107,24 @@ bool InstructionStream::IsWeakObjectInDeoptimizationLiteralArray(
              HeapObject::cast(object));
 }
 
+void InstructionStream::IterateDeoptimizationLiterals(RootVisitor* v) {
+  if (kind() == CodeKind::BASELINE) return;
+
+  auto deopt_data = DeoptimizationData::cast(deoptimization_data());
+  if (deopt_data.length() == 0) return;
+
+  DeoptimizationLiteralArray literals = deopt_data.LiteralArray();
+  const int literals_length = literals.length();
+  for (int i = 0; i < literals_length; ++i) {
+    MaybeObject maybe_literal = literals.Get(i);
+    HeapObject heap_literal;
+    if (maybe_literal.GetHeapObject(&heap_literal)) {
+      v->VisitRootPointer(Root::kStackRoots, "deoptimization literal",
+                          FullObjectSlot(&heap_literal));
+    }
+  }
+}
+
 // This field has to have relaxed atomic accessors because it is accessed in the
 // concurrent marker.
 static_assert(FIELD_SIZE(Code::kKindSpecificFlagsOffset) == kInt32Size);
@@ -1166,8 +1188,7 @@ Object Code::raw_instruction_stream(RelaxedLoadTag tag) const {
 
 Object Code::raw_instruction_stream(PtrComprCageBase cage_base,
                                     RelaxedLoadTag tag) const {
-  DCHECK(has_instruction_stream());
-  return ExternalCodeField<HeapObject>::Relaxed_Load(cage_base, *this);
+  return ExternalCodeField<Object>::Relaxed_Load(cage_base, *this);
 }
 
 DEF_GETTER(Code, code_entry_point, Address) {
@@ -1203,18 +1224,7 @@ void Code::UpdateCodeEntryPoint(Isolate* isolate_for_sandbox,
 
 Address Code::InstructionStart() const { return code_entry_point(); }
 
-Address Code::raw_instruction_start() const { return code_entry_point(); }
-Address Code::raw_instruction_end() const {
-  DCHECK(has_instruction_stream());
-  return InstructionStream::unchecked_cast(raw_instruction_stream())
-      .instruction_end();
-}
-int Code::raw_instruction_size() const {
-  return instruction_stream().instruction_size();
-}
-Address Code::raw_body_size() const { return instruction_stream().body_size(); }
-
-Address Code::entry() const { return code_entry_point(); }
+Address Code::body_size() const { return instruction_stream().body_size(); }
 
 void Code::clear_padding() {
   memset(reinterpret_cast<void*>(address() + kUnalignedSize), 0,
@@ -1398,15 +1408,50 @@ DEF_GETTER(BytecodeArray, SourcePositionTable, ByteArray) {
   return roots.empty_byte_array();
 }
 
+DEF_GETTER(BytecodeArray, raw_constant_pool, Object) {
+  Object value =
+      TaggedField<Object>::load(cage_base, *this, kConstantPoolOffset);
+  // This field might be 0 during deserialization.
+  DCHECK(value == Smi::zero() || value.IsFixedArray());
+  return value;
+}
+
+DEF_GETTER(BytecodeArray, raw_handler_table, Object) {
+  Object value =
+      TaggedField<Object>::load(cage_base, *this, kHandlerTableOffset);
+  // This field might be 0 during deserialization.
+  DCHECK(value == Smi::zero() || value.IsByteArray());
+  return value;
+}
+
+DEF_GETTER(BytecodeArray, raw_source_position_table, Object) {
+  Object value =
+      TaggedField<Object>::load(cage_base, *this, kSourcePositionTableOffset);
+  // This field might be 0 during deserialization.
+  DCHECK(value == Smi::zero() || value.IsByteArray() || value.IsUndefined() ||
+         value.IsException());
+  return value;
+}
+
 int BytecodeArray::BytecodeArraySize() const { return SizeFor(this->length()); }
 
 DEF_GETTER(BytecodeArray, SizeIncludingMetadata, int) {
   int size = BytecodeArraySize();
-  size += constant_pool(cage_base).Size(cage_base);
-  size += handler_table(cage_base).Size();
-  ByteArray table = SourcePositionTable(cage_base);
-  if (table.length() != 0) {
-    size += table.Size();
+  Object maybe_constant_pool = raw_constant_pool(cage_base);
+  if (maybe_constant_pool.IsFixedArray()) {
+    size += FixedArray::cast(maybe_constant_pool).Size(cage_base);
+  } else {
+    DCHECK_EQ(maybe_constant_pool, Smi::zero());
+  }
+  Object maybe_handler_table = raw_handler_table(cage_base);
+  if (maybe_handler_table.IsByteArray()) {
+    size += ByteArray::cast(maybe_handler_table).Size();
+  } else {
+    DCHECK_EQ(maybe_handler_table, Smi::zero());
+  }
+  Object maybe_table = raw_source_position_table(cage_base);
+  if (maybe_table.IsByteArray()) {
+    size += ByteArray::cast(maybe_table).Size();
   }
   return size;
 }

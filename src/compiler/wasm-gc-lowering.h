@@ -10,6 +10,7 @@
 #define V8_COMPILER_WASM_GC_LOWERING_H_
 
 #include "src/compiler/graph-reducer.h"
+#include "src/compiler/wasm-compiler-definitions.h"
 #include "src/compiler/wasm-graph-assembler.h"
 
 namespace v8 {
@@ -45,9 +46,15 @@ class WasmGCLowering final : public AdvancedReducer {
   Reduction ReduceWasmArraySet(Node* node);
   Reduction ReduceWasmArrayLength(Node* node);
   Reduction ReduceWasmArrayInitializeLength(Node* node);
+  Reduction ReduceStringAsWtf16(Node* node);
+  Reduction ReduceStringPrepareForGetCodeunit(Node* node);
+  Node* IsolateRoot();
   Node* RootNode(RootIndex index);
-  Node* Null();
-  Node* IsNull(Node* object);
+  Node* Null(wasm::ValueType type);
+  Node* IsNull(Node* object, wasm::ValueType type);
+  Node* BuildLoadExternalPointerFromObject(Node* object, int offset,
+                                           ExternalPointerTag tag);
+  NullCheckStrategy null_check_strategy_;
   WasmGraphAssembler gasm_;
   const wasm::WasmModule* module_;
   Node* dead_;

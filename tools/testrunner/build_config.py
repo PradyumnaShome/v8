@@ -64,6 +64,9 @@ class BuildConfig(object):
     self.verify_heap = build_config['v8_enable_verify_heap']
     self.webassembly = build_config['v8_enable_webassembly']
     self.write_barriers = not build_config['v8_disable_write_barriers']
+    # TODO(jgruber): Don't rename once it's no longer necessary to avoid
+    # conflicts with test variant names.
+    self.jitless_build_mode = build_config['v8_jitless']
     # Export only for MIPS target
     if self.arch in ['mips64', 'mips64el']:
       self._mips_arch_variant = build_config['mips_arch_variant']
@@ -155,6 +158,7 @@ class BuildConfig(object):
         'gdbjit',
         'is_debug',
         'is_DEBUG_defined',
+        'jitless_build_mode',
         'lite_mode',
         'maglev',
         'msan',
@@ -173,4 +177,4 @@ class BuildConfig(object):
         'webassembly',
     ]
     detected_options = [attr for attr in attrs if getattr(self, attr, False)]
-    return '\n'.join(detected_options)
+    return ', '.join(detected_options)

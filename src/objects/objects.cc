@@ -651,6 +651,9 @@ bool Object::BooleanValue(IsolateT* isolate) {
   DCHECK(IsHeapObject());
   if (IsBoolean()) return IsTrue(isolate);
   if (IsNullOrUndefined(isolate)) return false;
+#ifdef V8_ENABLE_WEBASSEMBLY
+  if (IsWasmNull()) return false;
+#endif
   if (IsUndetectable()) return false;  // Undetectable object is false.
   if (IsString()) return String::cast(*this).length() != 0;
   if (IsHeapNumber()) return DoubleToBoolean(HeapNumber::cast(*this).value());
@@ -2292,6 +2295,9 @@ int HeapObject::SizeFromMap(Map map) const {
   if (instance_type == WASM_ARRAY_TYPE) {
     return WasmArray::SizeFor(map, WasmArray::unchecked_cast(*this).length());
   }
+  if (instance_type == WASM_NULL_TYPE) {
+    return WasmNull::kSize;
+  }
 #endif  // V8_ENABLE_WEBASSEMBLY
   DCHECK_EQ(instance_type, EMBEDDER_DATA_ARRAY_TYPE);
   return EmbedderDataArray::SizeFor(
@@ -2447,7 +2453,6 @@ void DescriptorArray::GeneralizeAllFields() {
     details = details.CopyWithRepresentation(Representation::Tagged());
     if (details.location() == PropertyLocation::kField) {
       DCHECK_EQ(PropertyKind::kData, details.kind());
-      details = details.CopyWithConstness(PropertyConstness::kMutable);
       SetValue(i, MaybeObject::FromObject(FieldType::Any()));
     }
     SetDetails(i, details);
@@ -3612,7 +3617,7 @@ Maybe<bool> JSProxy::SetPrivateSymbol(Isolate* isolate, Handle<JSProxy> proxy,
 
   PropertyDetails details(PropertyKind::kData, DONT_ENUM,
                           PropertyConstness::kMutable);
-  if (V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL) {
+  if constexpr (V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL) {
     Handle<SwissNameDictionary> dict(proxy->property_dictionary_swiss(),
                                      isolate);
     Handle<SwissNameDictionary> result =
@@ -6008,19 +6013,6 @@ Handle<RegisteredSymbolTable> RegisteredSymbolTable::Add(
   return table;
 }
 
-Handle<ObjectHashSet> ObjectHashSet::Add(Isolate* isolate,
-                                         Handle<ObjectHashSet> set,
-                                         Handle<Object> key) {
-  int32_t hash = key->GetOrCreateHash(isolate).value();
-  if (!set->Has(isolate, key, hash)) {
-    set = EnsureCapacity(isolate, set);
-    InternalIndex entry = set->FindInsertionEntry(isolate, hash);
-    set->set(EntryToIndex(entry), *key);
-    set->ElementAdded();
-  }
-  return set;
-}
-
 template <typename Derived, typename Shape>
 template <typename IsolateT>
 Handle<Derived> BaseNameDictionary<Derived, Shape>::New(
@@ -6031,6 +6023,17 @@ Handle<Derived> BaseNameDictionary<Derived, Shape>::New(
       isolate, at_least_space_for, allocation, capacity_option);
   dict->SetHash(PropertyArray::kNoHashSentinel);
   dict->set_next_enumeration_index(PropertyDetails::kInitialIndex);
+  return dict;
+}
+
+template <typename IsolateT>
+Handle<NameDictionary> NameDictionary::New(IsolateT* isolate,
+                                           int at_least_space_for,
+                                           AllocationType allocation,
+                                           MinimumCapacity capacity_option) {
+  auto dict = BaseNameDictionary<NameDictionary, NameDictionaryShape>::New(
+      isolate, at_least_space_for, allocation, capacity_option);
+  dict->set_flags(kFlagsDefault);
   return dict;
 }
 
@@ -6370,6 +6373,32 @@ Handle<Derived> ObjectHashTableBase<Derived, Shape>::Put(Handle<Derived> table,
                                                   hash);
 }
 
+namespace {
+
+template <typename T>
+void RehashObjectHashTableAndGCIfNeeded(Isolate* isolate, Handle<T> table) {
+  // Rehash if more than 33% of the entries are deleted entries.
+  // TODO(verwaest): Consider to shrink the fixed array in place.
+  if ((table->NumberOfDeletedElements() << 1) > table->NumberOfElements()) {
+    table->Rehash(isolate);
+  }
+  // If we're out of luck, we didn't get a GC recently, and so rehashing
+  // isn't enough to avoid a crash.
+  if (!table->HasSufficientCapacityToAdd(1)) {
+    int nof = table->NumberOfElements() + 1;
+    int capacity = T::ComputeCapacity(nof * 2);
+    if (capacity > T::kMaxCapacity) {
+      for (size_t i = 0; i < 2; ++i) {
+        isolate->heap()->CollectAllGarbage(
+            Heap::kNoGCFlags, GarbageCollectionReason::kFullHashtable);
+      }
+      table->Rehash(isolate);
+    }
+  }
+}
+
+}  // namespace
+
 template <typename Derived, typename Shape>
 Handle<Derived> ObjectHashTableBase<Derived, Shape>::Put(Isolate* isolate,
                                                          Handle<Derived> table,
@@ -6388,24 +6417,7 @@ Handle<Derived> ObjectHashTableBase<Derived, Shape>::Put(Isolate* isolate,
     return table;
   }
 
-  // Rehash if more than 33% of the entries are deleted entries.
-  // TODO(verwaest): Consider to shrink the fixed array in place.
-  if ((table->NumberOfDeletedElements() << 1) > table->NumberOfElements()) {
-    table->Rehash(isolate);
-  }
-  // If we're out of luck, we didn't get a GC recently, and so rehashing
-  // isn't enough to avoid a crash.
-  if (!table->HasSufficientCapacityToAdd(1)) {
-    int nof = table->NumberOfElements() + 1;
-    int capacity = ObjectHashTable::ComputeCapacity(nof * 2);
-    if (capacity > ObjectHashTable::kMaxCapacity) {
-      for (size_t i = 0; i < 2; ++i) {
-        isolate->heap()->CollectAllGarbage(
-            Heap::kNoGCFlags, GarbageCollectionReason::kFullHashtable);
-      }
-      table->Rehash(isolate);
-    }
-  }
+  RehashObjectHashTableAndGCIfNeeded(isolate, table);
 
   // Check whether the hash table should be extended.
   table = Derived::EnsureCapacity(isolate, table);
@@ -6460,6 +6472,90 @@ void ObjectHashTableBase<Derived, Shape>::RemoveEntry(InternalIndex entry) {
   this->set_the_hole(Derived::EntryToIndex(entry));
   this->set_the_hole(Derived::EntryToValueIndex(entry));
   this->ElementRemoved();
+}
+
+template <typename Derived, int N>
+std::array<Object, N> ObjectMultiHashTableBase<Derived, N>::Lookup(
+    Handle<Object> key) {
+  return Lookup(GetPtrComprCageBase(*this), key);
+}
+
+template <typename Derived, int N>
+std::array<Object, N> ObjectMultiHashTableBase<Derived, N>::Lookup(
+    PtrComprCageBase cage_base, Handle<Object> key) {
+  DisallowGarbageCollection no_gc;
+
+  ReadOnlyRoots roots = this->GetReadOnlyRoots(cage_base);
+  DCHECK(this->IsKey(roots, *key));
+
+  Object hash_obj = key->GetHash();
+  if (hash_obj.IsUndefined(roots)) {
+    return {roots.the_hole_value(), roots.the_hole_value()};
+  }
+  int32_t hash = Smi::ToInt(hash_obj);
+
+  InternalIndex entry = this->FindEntry(cage_base, roots, key, hash);
+  if (entry.is_not_found()) {
+    return {roots.the_hole_value(), roots.the_hole_value()};
+  }
+
+  int start_index = this->EntryToIndex(entry) +
+                    ObjectMultiHashTableShape<N>::kEntryValueIndex;
+  std::array<Object, N> values;
+  for (int i = 0; i < N; i++) {
+    values[i] = this->get(start_index + i);
+    DCHECK(!values[i].IsTheHole());
+  }
+  return values;
+}
+
+// static
+template <typename Derived, int N>
+Handle<Derived> ObjectMultiHashTableBase<Derived, N>::Put(
+    Isolate* isolate, Handle<Derived> table, Handle<Object> key,
+    const std::array<Handle<Object>, N>& values) {
+  ReadOnlyRoots roots(isolate);
+  DCHECK(table->IsKey(roots, *key));
+
+  int32_t hash = key->GetOrCreateHash(isolate).value();
+  InternalIndex entry = table->FindEntry(isolate, roots, key, hash);
+
+  // Overwrite values if entry is found.
+  if (entry.is_found()) {
+    table->SetEntryValues(entry, values);
+    return table;
+  }
+
+  RehashObjectHashTableAndGCIfNeeded(isolate, table);
+
+  // Check whether the hash table should be extended.
+  table = Derived::EnsureCapacity(isolate, table);
+  entry = table->FindInsertionEntry(isolate, hash);
+  table->set(Derived::EntryToIndex(entry), *key);
+  table->SetEntryValues(entry, values);
+  return table;
+}
+
+template <typename Derived, int N>
+void ObjectMultiHashTableBase<Derived, N>::SetEntryValues(
+    InternalIndex entry, const std::array<Handle<Object>, N>& values) {
+  int start_index = EntryToValueIndexStart(entry);
+  for (int i = 0; i < N; i++) {
+    this->set(start_index + i, *values[i]);
+  }
+}
+
+Handle<ObjectHashSet> ObjectHashSet::Add(Isolate* isolate,
+                                         Handle<ObjectHashSet> set,
+                                         Handle<Object> key) {
+  int32_t hash = key->GetOrCreateHash(isolate).value();
+  if (!set->Has(isolate, key, hash)) {
+    set = EnsureCapacity(isolate, set);
+    InternalIndex entry = set->FindInsertionEntry(isolate, hash);
+    set->set(EntryToIndex(entry), *key);
+    set->ElementAdded();
+  }
+  return set;
 }
 
 void JSSet::Initialize(Handle<JSSet> set, Isolate* isolate) {
@@ -6870,86 +6966,6 @@ Address Smi::LexicographicCompare(Isolate* isolate, Smi x, Smi y) {
   return Smi::FromInt(tie).ptr();
 }
 
-// Force instantiation of template instances class.
-// Please note this list is compiler dependent.
-// Keep this at the end of this file
-
-#define EXTERN_DEFINE_HASH_TABLE(DERIVED, SHAPE)                            \
-  template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)                  \
-      HashTable<DERIVED, SHAPE>;                                            \
-                                                                            \
-  template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) Handle<DERIVED>        \
-  HashTable<DERIVED, SHAPE>::New(Isolate*, int, AllocationType,             \
-                                 MinimumCapacity);                          \
-  template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) Handle<DERIVED>        \
-  HashTable<DERIVED, SHAPE>::New(LocalIsolate*, int, AllocationType,        \
-                                 MinimumCapacity);                          \
-                                                                            \
-  template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) Handle<DERIVED>        \
-  HashTable<DERIVED, SHAPE>::EnsureCapacity(Isolate*, Handle<DERIVED>, int, \
-                                            AllocationType);                \
-  template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) Handle<DERIVED>        \
-  HashTable<DERIVED, SHAPE>::EnsureCapacity(LocalIsolate*, Handle<DERIVED>, \
-                                            int, AllocationType);
-
-#define EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE(DERIVED, SHAPE) \
-  EXTERN_DEFINE_HASH_TABLE(DERIVED, SHAPE)                   \
-  template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)   \
-      ObjectHashTableBase<DERIVED, SHAPE>;
-
-#define EXTERN_DEFINE_DICTIONARY(DERIVED, SHAPE)                               \
-  EXTERN_DEFINE_HASH_TABLE(DERIVED, SHAPE)                                     \
-  template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)                     \
-      Dictionary<DERIVED, SHAPE>;                                              \
-                                                                               \
-  template V8_EXPORT_PRIVATE Handle<DERIVED> Dictionary<DERIVED, SHAPE>::Add(  \
-      Isolate* isolate, Handle<DERIVED>, Key, Handle<Object>, PropertyDetails, \
-      InternalIndex*);                                                         \
-  template V8_EXPORT_PRIVATE Handle<DERIVED> Dictionary<DERIVED, SHAPE>::Add(  \
-      LocalIsolate* isolate, Handle<DERIVED>, Key, Handle<Object>,             \
-      PropertyDetails, InternalIndex*);
-
-#define EXTERN_DEFINE_BASE_NAME_DICTIONARY(DERIVED, SHAPE)                     \
-  EXTERN_DEFINE_DICTIONARY(DERIVED, SHAPE)                                     \
-  template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)                     \
-      BaseNameDictionary<DERIVED, SHAPE>;                                      \
-                                                                               \
-  template V8_EXPORT_PRIVATE Handle<DERIVED>                                   \
-  BaseNameDictionary<DERIVED, SHAPE>::New(Isolate*, int, AllocationType,       \
-                                          MinimumCapacity);                    \
-  template V8_EXPORT_PRIVATE Handle<DERIVED>                                   \
-  BaseNameDictionary<DERIVED, SHAPE>::New(LocalIsolate*, int, AllocationType,  \
-                                          MinimumCapacity);                    \
-                                                                               \
-  template Handle<DERIVED>                                                     \
-  BaseNameDictionary<DERIVED, SHAPE>::AddNoUpdateNextEnumerationIndex(         \
-      Isolate* isolate, Handle<DERIVED>, Key, Handle<Object>, PropertyDetails, \
-      InternalIndex*);                                                         \
-  template Handle<DERIVED>                                                     \
-  BaseNameDictionary<DERIVED, SHAPE>::AddNoUpdateNextEnumerationIndex(         \
-      LocalIsolate* isolate, Handle<DERIVED>, Key, Handle<Object>,             \
-      PropertyDetails, InternalIndex*);
-
-EXTERN_DEFINE_HASH_TABLE(StringSet, StringSetShape)
-EXTERN_DEFINE_HASH_TABLE(CompilationCacheTable, CompilationCacheShape)
-EXTERN_DEFINE_HASH_TABLE(ObjectHashSet, ObjectHashSetShape)
-EXTERN_DEFINE_HASH_TABLE(NameToIndexHashTable, NameToIndexShape)
-EXTERN_DEFINE_HASH_TABLE(RegisteredSymbolTable, RegisteredSymbolTableShape)
-
-EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE(ObjectHashTable, ObjectHashTableShape)
-EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE(EphemeronHashTable, ObjectHashTableShape)
-
-EXTERN_DEFINE_DICTIONARY(SimpleNumberDictionary, SimpleNumberDictionaryShape)
-EXTERN_DEFINE_DICTIONARY(NumberDictionary, NumberDictionaryShape)
-
-EXTERN_DEFINE_BASE_NAME_DICTIONARY(NameDictionary, NameDictionaryShape)
-EXTERN_DEFINE_BASE_NAME_DICTIONARY(GlobalDictionary, GlobalDictionaryShape)
-
-#undef EXTERN_DEFINE_HASH_TABLE
-#undef EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE
-#undef EXTERN_DEFINE_DICTIONARY
-#undef EXTERN_DEFINE_BASE_NAME_DICTIONARY
-
 void JSFinalizationRegistry::RemoveCellFromUnregisterTokenMap(
     Isolate* isolate, Address raw_finalization_registry,
     Address raw_weak_cell) {
@@ -7001,6 +7017,98 @@ void JSFinalizationRegistry::RemoveCellFromUnregisterTokenMap(
   weak_cell.set_key_list_prev(undefined);
   weak_cell.set_key_list_next(undefined);
 }
+
+// Force instantiation of template instances class.
+// Please note this list is compiler dependent.
+// Keep this at the end of this file
+
+#define EXTERN_DEFINE_HASH_TABLE(DERIVED, SHAPE)                            \
+  template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)                  \
+      HashTable<DERIVED, SHAPE>;                                            \
+                                                                            \
+  template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) Handle<DERIVED>        \
+  HashTable<DERIVED, SHAPE>::New(Isolate*, int, AllocationType,             \
+                                 MinimumCapacity);                          \
+  template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) Handle<DERIVED>        \
+  HashTable<DERIVED, SHAPE>::New(LocalIsolate*, int, AllocationType,        \
+                                 MinimumCapacity);                          \
+                                                                            \
+  template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) Handle<DERIVED>        \
+  HashTable<DERIVED, SHAPE>::EnsureCapacity(Isolate*, Handle<DERIVED>, int, \
+                                            AllocationType);                \
+  template EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE) Handle<DERIVED>        \
+  HashTable<DERIVED, SHAPE>::EnsureCapacity(LocalIsolate*, Handle<DERIVED>, \
+                                            int, AllocationType);
+
+#define EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE(DERIVED, SHAPE) \
+  EXTERN_DEFINE_HASH_TABLE(DERIVED, SHAPE)                   \
+  template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)   \
+      ObjectHashTableBase<DERIVED, SHAPE>;
+
+#define EXTERN_DEFINE_MULTI_OBJECT_BASE_HASH_TABLE(DERIVED, N)    \
+  EXTERN_DEFINE_HASH_TABLE(DERIVED, ObjectMultiHashTableShape<N>) \
+  template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)        \
+      ObjectMultiHashTableBase<DERIVED, N>;
+
+#define EXTERN_DEFINE_DICTIONARY(DERIVED, SHAPE)                               \
+  EXTERN_DEFINE_HASH_TABLE(DERIVED, SHAPE)                                     \
+  template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)                     \
+      Dictionary<DERIVED, SHAPE>;                                              \
+                                                                               \
+  template V8_EXPORT_PRIVATE Handle<DERIVED> Dictionary<DERIVED, SHAPE>::Add(  \
+      Isolate* isolate, Handle<DERIVED>, Key, Handle<Object>, PropertyDetails, \
+      InternalIndex*);                                                         \
+  template V8_EXPORT_PRIVATE Handle<DERIVED> Dictionary<DERIVED, SHAPE>::Add(  \
+      LocalIsolate* isolate, Handle<DERIVED>, Key, Handle<Object>,             \
+      PropertyDetails, InternalIndex*);
+
+#define EXTERN_DEFINE_BASE_NAME_DICTIONARY(DERIVED, SHAPE)                     \
+  EXTERN_DEFINE_DICTIONARY(DERIVED, SHAPE)                                     \
+  template class EXPORT_TEMPLATE_DEFINE(V8_EXPORT_PRIVATE)                     \
+      BaseNameDictionary<DERIVED, SHAPE>;                                      \
+                                                                               \
+  template V8_EXPORT_PRIVATE Handle<DERIVED>                                   \
+  BaseNameDictionary<DERIVED, SHAPE>::New(Isolate*, int, AllocationType,       \
+                                          MinimumCapacity);                    \
+  template V8_EXPORT_PRIVATE Handle<DERIVED>                                   \
+  BaseNameDictionary<DERIVED, SHAPE>::New(LocalIsolate*, int, AllocationType,  \
+                                          MinimumCapacity);                    \
+                                                                               \
+  template Handle<DERIVED>                                                     \
+  BaseNameDictionary<DERIVED, SHAPE>::AddNoUpdateNextEnumerationIndex(         \
+      Isolate* isolate, Handle<DERIVED>, Key, Handle<Object>, PropertyDetails, \
+      InternalIndex*);                                                         \
+  template Handle<DERIVED>                                                     \
+  BaseNameDictionary<DERIVED, SHAPE>::AddNoUpdateNextEnumerationIndex(         \
+      LocalIsolate* isolate, Handle<DERIVED>, Key, Handle<Object>,             \
+      PropertyDetails, InternalIndex*);
+
+EXTERN_DEFINE_HASH_TABLE(StringSet, StringSetShape)
+EXTERN_DEFINE_HASH_TABLE(CompilationCacheTable, CompilationCacheShape)
+EXTERN_DEFINE_HASH_TABLE(ObjectHashSet, ObjectHashSetShape)
+EXTERN_DEFINE_HASH_TABLE(NameToIndexHashTable, NameToIndexShape)
+EXTERN_DEFINE_HASH_TABLE(RegisteredSymbolTable, RegisteredSymbolTableShape)
+
+EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE(ObjectHashTable, ObjectHashTableShape)
+EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE(EphemeronHashTable, ObjectHashTableShape)
+
+EXTERN_DEFINE_MULTI_OBJECT_BASE_HASH_TABLE(ObjectTwoHashTable, 2)
+
+EXTERN_DEFINE_DICTIONARY(SimpleNumberDictionary, SimpleNumberDictionaryShape)
+EXTERN_DEFINE_DICTIONARY(NumberDictionary, NumberDictionaryShape)
+
+EXTERN_DEFINE_BASE_NAME_DICTIONARY(NameDictionary, NameDictionaryShape)
+template V8_EXPORT_PRIVATE Handle<NameDictionary> NameDictionary::New(
+    Isolate*, int, AllocationType, MinimumCapacity);
+template V8_EXPORT_PRIVATE Handle<NameDictionary> NameDictionary::New(
+    LocalIsolate*, int, AllocationType, MinimumCapacity);
+
+EXTERN_DEFINE_BASE_NAME_DICTIONARY(GlobalDictionary, GlobalDictionaryShape)
+
+#undef EXTERN_DEFINE_HASH_TABLE
+#undef EXTERN_DEFINE_OBJECT_BASE_HASH_TABLE
+#undef EXTERN_DEFINE_DICTIONARY
+#undef EXTERN_DEFINE_BASE_NAME_DICTIONARY
 
 }  // namespace internal
 }  // namespace v8

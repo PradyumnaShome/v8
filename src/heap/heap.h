@@ -981,7 +981,7 @@ class Heap {
   // Performs garbage collection operation.
   // Returns whether there is a chance that another major GC could
   // collect more garbage.
-  V8_EXPORT_PRIVATE bool CollectGarbage(
+  V8_EXPORT_PRIVATE void CollectGarbage(
       AllocationSpace space, GarbageCollectionReason gc_reason,
       const GCCallbackFlags gc_callback_flags = kNoGCCallbackFlags);
 
@@ -1048,10 +1048,12 @@ class Heap {
   void IterateWeakGlobalHandles(RootVisitor* v);
   void IterateBuiltins(RootVisitor* v);
 
-  enum class ScanStackMode { kNone, kFromMarker, kComplete };
-  void IterateStackRoots(RootVisitor* v, ScanStackMode stack_mode);
-  void IterateStackRootsIncludingClients(RootVisitor* v,
-                                         ScanStackMode stack_mode);
+  void IterateStackRoots(RootVisitor* v);
+
+  enum class ScanStackMode { kFromMarker, kComplete };
+  void IterateConservativeStackRoots(RootVisitor* v, ScanStackMode stack_mode);
+  void IterateConservativeStackRootsIncludingClients(RootVisitor* v,
+                                                     ScanStackMode stack_mode);
 
   // ===========================================================================
   // Remembered set API. =======================================================
@@ -1236,10 +1238,6 @@ class Heap {
   // Checks whether an address/object in a space.
   // Currently used by tests, serialization and heap verification only.
   V8_EXPORT_PRIVATE bool InSpace(HeapObject value, AllocationSpace space) const;
-
-  // Returns true when this heap is shared.
-  V8_EXPORT_PRIVATE bool IsShared() const;
-  V8_EXPORT_PRIVATE bool ShouldMarkSharedHeap() const;
 
   // Slow methods that can be used for verification as they can also be used
   // with off-heap Addresses.
@@ -1691,6 +1689,8 @@ class Heap {
     void UpdateReferences(
         Heap::ExternalStringTableUpdaterCallback updater_func);
 
+    bool HasYoung() const { return !young_strings_.empty(); }
+
    private:
     void Verify();
     void VerifyYoung();
@@ -1703,31 +1703,10 @@ class Heap {
     std::vector<Object> old_strings_;
   };
 
-  struct StringTypeTable {
-    InstanceType type;
-    int size;
-    RootIndex index;
-  };
-
-  struct ConstantStringTable {
-    const char* contents;
-    RootIndex index;
-  };
-
-  struct StructTable {
-    InstanceType type;
-    int size;
-    RootIndex index;
-  };
-
   static const int kInitialEvalCacheSize = 64;
   static const int kInitialNumberStringCacheSize = 256;
 
   static const int kRememberedUnmappedPages = 128;
-
-  static const StringTypeTable string_type_table[];
-  static const ConstantStringTable constant_string_table[];
-  static const StructTable struct_table[];
 
   static const int kYoungSurvivalRateHighThreshold = 90;
   static const int kYoungSurvivalRateAllowedDeviation = 15;
@@ -1780,21 +1759,19 @@ class Heap {
   void UnmarkSharedLinearAllocationAreas();
 
   // Performs garbage collection in a safepoint.
-  // Returns the number of freed global handles.
-  size_t PerformGarbageCollection(GarbageCollector collector,
-                                  GarbageCollectionReason gc_reason,
-                                  const char* collector_reason);
-
-  // Performs garbage collection in the shared heap.
-  void PerformSharedGarbageCollection(Isolate* initiator,
-                                      GarbageCollectionReason gc_reason);
+  void PerformGarbageCollection(GarbageCollector collector,
+                                GarbageCollectionReason gc_reason,
+                                const char* collector_reason);
 
   inline void UpdateOldSpaceLimits();
 
-  bool CreateInitialReadOnlyMaps();
+  bool CreateEarlyReadOnlyMaps();
+  bool CreateImportantReadOnlyObjects();
+  bool CreateLateReadOnlyMaps();
+  bool CreateReadOnlyObjects();
+
   void CreateInternalAccessorInfoObjects();
   void CreateInitialMutableObjects();
-  void CreateInitialReadOnlyObjects();
 
   // Zaps the memory of a code object.
   V8_EXPORT_PRIVATE void ZapCodeObject(Address start_address,
@@ -2201,7 +2178,7 @@ class Heap {
 
   // Starts marking when stress_marking_percentage_% of the marking start limit
   // is reached.
-  std::atomic<int> stress_marking_percentage_{0};
+  int stress_marking_percentage_ = 0;
 
   // Observer that causes more frequent checks for reached incremental
   // marking limit.

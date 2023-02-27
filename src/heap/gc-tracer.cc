@@ -730,12 +730,11 @@ void GCTracer::Print() const {
   Output(
       "[%d:%p] "
       "%8.0f ms: "
-      "%s%s%s %.1f (%.1f) -> %.1f (%.1f) MB, "
+      "%s%s %.1f (%.1f) -> %.1f (%.1f) MB, "
       "%.2f / %.2f ms %s (average mu = %.3f, current mu = %.3f) %s; %s\n",
       base::OS::GetCurrentProcessId(),
       reinterpret_cast<void*>(heap_->isolate()),
-      heap_->isolate()->time_millis_since_init(),
-      heap_->IsShared() ? "Shared " : "", current_.TypeName(false),
+      heap_->isolate()->time_millis_since_init(), current_.TypeName(false),
       current_.reduce_memory ? " (reduce)" : "",
       static_cast<double>(current_.start_object_size) / MB,
       static_cast<double>(current_.start_memory_size) / MB,
@@ -861,24 +860,23 @@ void GCTracer::PrintNVP() const {
           "mark.seed=%.2f "
           "mark.closure_parallel=%.2f "
           "mark.closure=%.2f "
-          "mark.global_handles=%.2f "
           "clear=%.2f "
+          "clear.string_forwarding_table=%.2f "
           "clear.string_table=%.2f "
+          "clear.global_handles=%.2f "
           "complete.sweep_array_buffers=%.2f "
           "complete.sweeping=%.2f "
-          "evacuate=%.2f "
-          "evacuate.copy=%.2f "
-          "evacuate.prologue=%.2f "
-          "evacuate.epilogue=%.2f "
-          "evacuate.rebalance=%.2f "
-          "evacuate.update_string_table=%.2f "
           "sweep=%.2f "
           "sweep.new=%.2f "
           "sweep.new_lo=%.2f "
+          "sweep.update_string_table=%.2f "
+          "sweep.start_jobs=%.2f "
+          "sweep.array_buffers=%.2f "
           "finish=%.2f "
-          "finish.sweep_array_buffers=%.2f "
+          "finish.ensure_capacity=%.2f "
           "background.mark=%.2f "
           "background.sweep=%.2f "
+          "background.sweep.array_buffers=%.2f "
           "background.evacuate.copy=%.2f "
           "background.unmapper=%.2f "
           "unmapper=%.2f "
@@ -906,24 +904,23 @@ void GCTracer::PrintNVP() const {
           current_scope(Scope::MINOR_MC_MARK_SEED),
           current_scope(Scope::MINOR_MC_MARK_CLOSURE_PARALLEL),
           current_scope(Scope::MINOR_MC_MARK_CLOSURE),
-          current_scope(Scope::MINOR_MC_MARK_GLOBAL_HANDLES),
           current_scope(Scope::MINOR_MC_CLEAR),
+          current_scope(Scope::MINOR_MC_CLEAR_STRING_FORWARDING_TABLE),
           current_scope(Scope::MINOR_MC_CLEAR_STRING_TABLE),
+          current_scope(Scope::MINOR_MC_CLEAR_WEAK_GLOBAL_HANDLES),
           current_scope(Scope::MINOR_MC_COMPLETE_SWEEP_ARRAY_BUFFERS),
           current_scope(Scope::MINOR_MC_COMPLETE_SWEEPING),
-          current_scope(Scope::MINOR_MC_EVACUATE),
-          current_scope(Scope::MINOR_MC_EVACUATE_COPY),
-          current_scope(Scope::MINOR_MC_EVACUATE_PROLOGUE),
-          current_scope(Scope::MINOR_MC_EVACUATE_EPILOGUE),
-          current_scope(Scope::MINOR_MC_EVACUATE_REBALANCE),
-          current_scope(Scope::MINOR_MC_EVACUATE_UPDATE_STRING_TABLE),
           current_scope(Scope::MINOR_MC_SWEEP),
           current_scope(Scope::MINOR_MC_SWEEP_NEW),
           current_scope(Scope::MINOR_MC_SWEEP_NEW_LO),
+          current_scope(Scope::MINOR_MC_SWEEP_UPDATE_STRING_TABLE),
+          current_scope(Scope::MINOR_MC_SWEEP_START_JOBS),
+          current_scope(Scope::YOUNG_ARRAY_BUFFER_SWEEP),
           current_scope(Scope::MINOR_MC_FINISH),
-          current_scope(Scope::MINOR_MC_FINISH_SWEEP_ARRAY_BUFFERS),
+          current_scope(Scope::MINOR_MC_FINISH_ENSURE_CAPACITY),
           current_scope(Scope::MINOR_MC_BACKGROUND_MARKING),
           current_scope(Scope::MINOR_MC_BACKGROUND_SWEEPING),
+          current_scope(Scope::BACKGROUND_YOUNG_ARRAY_BUFFER_SWEEP),
           current_scope(Scope::MINOR_MC_BACKGROUND_EVACUATE_COPY),
           current_scope(Scope::BACKGROUND_UNMAPPER),
           current_scope(Scope::UNMAPPER), current_.start_object_size,

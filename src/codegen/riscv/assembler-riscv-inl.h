@@ -162,7 +162,7 @@ void Assembler::deserialization_set_target_internal_reference_at(
 HeapObject RelocInfo::target_object(PtrComprCageBase cage_base) {
   DCHECK(IsCodeTarget(rmode_) || IsEmbeddedObjectMode(rmode_));
   if (IsCompressedEmbeddedObject(rmode_)) {
-    return HeapObject::cast(Object(V8HeapCompressionScheme::DecompressTaggedAny(
+    return HeapObject::cast(Object(V8HeapCompressionScheme::DecompressTagged(
         cage_base,
         Assembler::target_compressed_address_at(pc_, constant_pool_))));
   } else {
@@ -193,7 +193,7 @@ void RelocInfo::set_target_object(Heap* heap, HeapObject target,
   if (IsCompressedEmbeddedObject(rmode_)) {
     Assembler::set_target_compressed_address_at(
         pc_, constant_pool_,
-        V8HeapCompressionScheme::CompressTagged(target.ptr()),
+        V8HeapCompressionScheme::CompressObject(target.ptr()),
         icache_flush_mode);
   } else {
     DCHECK(IsFullEmbeddedObject(rmode_));

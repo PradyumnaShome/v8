@@ -26,8 +26,23 @@ namespace v8::internal::compiler::turboshaft {
 
 template <typename>
 class TypeInferenceReducer;
+
 struct TypeInferenceReducerArgs {
+  enum class InputGraphTyping {
+    kNone,     // Do not compute types for the input graph.
+    kPrecise,  // Run a complete fixpoint analysis on the input graph.
+  };
+  enum class OutputGraphTyping {
+    kNone,                    // Do not compute types for the output graph.
+    kPreserveFromInputGraph,  // Reuse types of the input graph where
+                              // possible.
+    kRefineFromInputGraph,  // Reuse types of the input graph and compute types
+                            // for new nodes and more precise types where
+                            // possible.
+  };
   Isolate* isolate;
+  InputGraphTyping input_graph_typing;
+  OutputGraphTyping output_graph_typing;
 };
 
 using Variable =
@@ -112,8 +127,12 @@ class OptimizationPhase {
     if constexpr (has_type_inference) {
       return args;
     } else {
-      return std::tuple_cat(std::make_tuple(TypeInferenceReducerArgs{isolate}),
-                            args);
+      return std::tuple_cat(
+          std::make_tuple(TypeInferenceReducerArgs{
+              isolate, TypeInferenceReducerArgs::InputGraphTyping::kPrecise,
+              TypeInferenceReducerArgs::OutputGraphTyping::
+                  kRefineFromInputGraph}),
+          args);
     }
   }
 #endif
@@ -633,6 +652,12 @@ class GraphVisitor {
     return assembler().ReduceTryChange(MapToNewGraph(op.input()), op.kind,
                                        op.from, op.to);
   }
+  OpIndex AssembleOutputGraphTag(const TagOp& op) {
+    return assembler().ReduceTag(MapToNewGraph(op.input()), op.kind);
+  }
+  OpIndex AssembleOutputGraphUntag(const UntagOp& op) {
+    return assembler().ReduceUntag(MapToNewGraph(op.input()), op.kind, op.rep);
+  }
 
   OpIndex AssembleOutputGraphFloat64InsertWord32(
       const Float64InsertWord32Op& op) {
@@ -643,17 +668,14 @@ class GraphVisitor {
     return assembler().ReduceTaggedBitcast(MapToNewGraph(op.input()), op.from,
                                            op.to);
   }
-  OpIndex AssembleOutputGraphCheck(const CheckOp& op) {
-    return assembler().ReduceCheck(MapToNewGraph(op.input()),
-                                   MapToNewGraph(op.frame_state()), op.kind,
-                                   op.feedback);
-  }
-  OpIndex AssembleOutputGraphIsSmiTagged(const IsSmiTaggedOp& op) {
-    return assembler().ReduceIsSmiTagged(MapToNewGraph(op.input()));
+  OpIndex AssembleOutputGraphObjectIs(const ObjectIsOp& op) {
+    return assembler().ReduceObjectIs(MapToNewGraph(op.input()), op.kind,
+                                      op.input_assumptions);
   }
   OpIndex AssembleOutputGraphConvertToObject(const ConvertToObjectOp& op) {
-    return assembler().ReduceConvertToObject(MapToNewGraph(op.input()),
-                                             op.kind);
+    return assembler().ReduceConvertToObject(
+        MapToNewGraph(op.input()), op.kind, op.input_rep,
+        op.input_interpretation, op.minus_zero_mode);
   }
   OpIndex AssembleOutputGraphSelect(const SelectOp& op) {
     return assembler().ReduceSelect(

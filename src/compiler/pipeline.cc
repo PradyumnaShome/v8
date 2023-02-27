@@ -96,6 +96,7 @@
 #include "src/compiler/turboshaft/recreate-schedule.h"
 #include "src/compiler/turboshaft/select-lowering-reducer.h"
 #include "src/compiler/turboshaft/simplify-tf-loops.h"
+#include "src/compiler/turboshaft/tag-untag-lowering-reducer.h"
 #include "src/compiler/turboshaft/type-inference-reducer.h"
 #include "src/compiler/turboshaft/typed-optimizations-reducer.h"
 #include "src/compiler/turboshaft/types.h"
@@ -753,7 +754,10 @@ class PipelineImpl final {
   // Step D. Run the code finalization pass.
   MaybeHandle<Code> FinalizeCode(bool retire_broker = true);
 
-  // Step E. Install any code dependencies.
+  // Step E. Ensure all embedded maps are non-deprecated.
+  bool CheckNoDeprecatedMaps(Handle<Code> code);
+
+  // Step F. Install any code dependencies.
   bool CommitDependencies(Handle<Code> code);
 
   void VerifyGeneratedCodeIsIdempotent();
@@ -1187,7 +1191,8 @@ namespace {
 // is running on a background or foreground thread.
 class V8_NODISCARD PipelineJobScope {
  public:
-  PipelineJobScope(PipelineData* data, RuntimeCallStats* stats) : data_(data) {
+  PipelineJobScope(PipelineData* data, RuntimeCallStats* stats)
+      : data_(data), current_broker_(data_->broker()) {
     data_->set_runtime_call_stats(stats);
   }
 
@@ -1197,6 +1202,7 @@ class V8_NODISCARD PipelineJobScope {
   HighAllocationThroughputScope high_throughput_scope_{
       V8::GetCurrentPlatform()};
   PipelineData* data_;
+  CurrentHeapBrokerScope current_broker_;
 };
 }  // namespace
 
@@ -1295,6 +1301,9 @@ PipelineCompilationJob::Status PipelineCompilationJob::FinalizeJobImpl(
     }
     return FAILED;
   }
+  if (!pipeline_.CheckNoDeprecatedMaps(code)) {
+    return RetryOptimization(BailoutReason::kConcurrentMapDeprecation);
+  }
   if (!pipeline_.CommitDependencies(code)) {
     return RetryOptimization(BailoutReason::kBailedOutDueToDependencyChange);
   }
@@ -1371,18 +1380,18 @@ struct GraphBuilderPhase {
       flags |= BytecodeGraphBuilderFlag::kBailoutOnUninitialized;
     }
 
-    UnparkedScopeIfNeeded scope(data->broker());
-    JSFunctionRef closure = MakeRef(data->broker(), data->info()->closure());
+    JSHeapBroker* broker = data->broker();
+    UnparkedScopeIfNeeded scope(broker);
+    JSFunctionRef closure = MakeRef(broker, data->info()->closure());
     CallFrequency frequency(1.0f);
-    BuildGraphFromBytecode(data->broker(), temp_zone, closure.shared(),
-                           closure.raw_feedback_cell(data->dependencies()),
-                           data->info()->osr_offset(), data->jsgraph(),
-                           frequency, data->source_positions(),
-                           data->node_origins(), SourcePosition::kNotInlined,
-                           data->info()->code_kind(), flags,
-                           &data->info()->tick_counter(),
-                           ObserveNodeInfo{data->observe_node_manager(),
-                                           data->info()->node_observer()});
+    BuildGraphFromBytecode(
+        broker, temp_zone, closure.shared(broker),
+        closure.raw_feedback_cell(broker), data->info()->osr_offset(),
+        data->jsgraph(), frequency, data->source_positions(),
+        data->node_origins(), SourcePosition::kNotInlined,
+        data->info()->code_kind(), flags, &data->info()->tick_counter(),
+        ObserveNodeInfo{data->observe_node_manager(),
+                        data->info()->node_observer()});
   }
 };
 
@@ -1424,8 +1433,8 @@ struct InliningPhase {
     // JSNativeContextSpecialization allocates out-of-heap objects
     // that need to live until code generation.
     JSNativeContextSpecialization native_context_specialization(
-        &graph_reducer, data->jsgraph(), data->broker(), flags,
-        data->dependencies(), temp_zone, info->zone());
+        &graph_reducer, data->jsgraph(), data->broker(), flags, temp_zone,
+        info->zone());
     JSInliningHeuristic inlining(&graph_reducer, temp_zone, data->info(),
                                  data->jsgraph(), data->broker(),
                                  data->source_positions(), data->node_origins(),
@@ -1560,9 +1569,8 @@ struct TypedLoweringPhase {
         data->jsgraph()->Dead(), data->observe_node_manager());
     DeadCodeElimination dead_code_elimination(&graph_reducer, data->graph(),
                                               data->common(), temp_zone);
-    JSCreateLowering create_lowering(&graph_reducer, data->dependencies(),
-                                     data->jsgraph(), data->broker(),
-                                     temp_zone);
+    JSCreateLowering create_lowering(&graph_reducer, data->jsgraph(),
+                                     data->broker(), temp_zone);
     JSTypedLowering typed_lowering(&graph_reducer, data->jsgraph(),
                                    data->broker(), temp_zone);
     ConstantFoldingReducer constant_folding_reducer(
@@ -1733,7 +1741,8 @@ struct WasmLoopUnrollingPhase {
               loop_info.header, all_nodes, temp_zone,
               // Only discover the loop until its size is the maximum unrolled
               // size for its depth.
-              maximum_unrollable_size(loop_info.nesting_depth), true);
+              maximum_unrollable_size(loop_info.nesting_depth),
+              LoopFinder::Purpose::kLoopUnrolling);
       if (loop == nullptr) continue;
       UnrollLoop(loop_info.header, loop, loop_info.nesting_depth, data->graph(),
                  data->common(), temp_zone, data->source_positions(),
@@ -1755,8 +1764,15 @@ struct WasmLoopPeelingPhase {
         ZoneUnorderedSet<Node*>* loop =
             LoopFinder::FindSmallInnermostLoopFromHeader(
                 loop_info.header, all_nodes, temp_zone,
-                v8_flags.wasm_loop_peeling_max_size, false);
+                v8_flags.wasm_loop_peeling_max_size,
+                LoopFinder::Purpose::kLoopPeeling);
         if (loop == nullptr) continue;
+        if (v8_flags.trace_wasm_loop_peeling) {
+          CodeTracer::StreamScope tracing_scope(data->GetCodeTracer());
+          auto& os = tracing_scope.stream();
+          os << "Peeling loop at " << loop_info.header->id() << ", size "
+             << loop->size() << std::endl;
+        }
         PeelWasmLoop(loop_info.header, loop, data->graph(), data->common(),
                      temp_zone, data->source_positions(), data->node_origins());
       }
@@ -1971,7 +1987,7 @@ struct MemoryOptimizationPhase {
 
     // Optimize allocations and load/store operations.
     MemoryOptimizer optimizer(
-        data->jsgraph(), temp_zone,
+        data->broker(), data->jsgraph(), temp_zone,
         data->info()->allocation_folding()
             ? MemoryLowering::AllocationFolding::kDoAllocationFolding
             : MemoryLowering::AllocationFolding::kDontAllocationFolding,
@@ -2012,8 +2028,8 @@ struct LateOptimizationPhase {
       CommonOperatorReducer common_reducer(
           &graph_reducer, data->graph(), data->broker(), data->common(),
           data->machine(), temp_zone, BranchSemantics::kMachine);
-      JSGraphAssembler graph_assembler(data->jsgraph(), temp_zone,
-                                       BranchSemantics::kMachine);
+      JSGraphAssembler graph_assembler(data->broker(), data->jsgraph(),
+                                       temp_zone, BranchSemantics::kMachine);
       SelectLowering select_lowering(&graph_assembler, data->graph());
       if (!v8_flags.turboshaft) {
         AddReducer(data, &graph_reducer, &escape_analysis);
@@ -2148,11 +2164,22 @@ struct TurboshaftTypedOptimizationsPhase {
 
   void Run(PipelineData* data, Zone* temp_zone) {
     DCHECK(data->HasTurboshaftGraph());
-    turboshaft::OptimizationPhase<turboshaft::TypedOptimizationsReducer,
-                                  turboshaft::TypeInferenceReducer>::
-        Run(data->isolate(), &data->turboshaft_graph(), temp_zone,
-            data->node_origins(),
-            std::tuple{turboshaft::TypeInferenceReducerArgs{data->isolate()}});
+#ifdef DEBUG
+    UnparkedScopeIfNeeded scope(data->broker(),
+                                v8_flags.turboshaft_trace_typing);
+#endif
+
+    turboshaft::TypeInferenceReducerArgs typing_args{
+        data->isolate(),
+        turboshaft::TypeInferenceReducerArgs::InputGraphTyping::kPrecise,
+        turboshaft::TypeInferenceReducerArgs::OutputGraphTyping::kNone};
+
+    turboshaft::OptimizationPhase<
+        turboshaft::TypedOptimizationsReducer,
+        turboshaft::TypeInferenceReducer>::Run(data->isolate(),
+                                               &data->turboshaft_graph(),
+                                               temp_zone, data->node_origins(),
+                                               {typing_args});
   }
 };
 
@@ -2163,12 +2190,18 @@ struct TurboshaftTypeAssertionsPhase {
     DCHECK(data->HasTurboshaftGraph());
     UnparkedScopeIfNeeded scope(data->broker());
 
+    turboshaft::TypeInferenceReducerArgs typing_args{
+        data->isolate(),
+        turboshaft::TypeInferenceReducerArgs::InputGraphTyping::kPrecise,
+        turboshaft::TypeInferenceReducerArgs::OutputGraphTyping::
+            kPreserveFromInputGraph};
+
     turboshaft::OptimizationPhase<turboshaft::AssertTypesReducer,
                                   turboshaft::ValueNumberingReducer,
                                   turboshaft::TypeInferenceReducer>::
         Run(data->isolate(), &data->turboshaft_graph(), temp_zone,
             data->node_origins(),
-            std::tuple{turboshaft::TypeInferenceReducerArgs{data->isolate()},
+            std::tuple{typing_args,
                        turboshaft::AssertTypesReducerArgs{data->isolate()}});
   }
 };
@@ -2178,8 +2211,20 @@ struct TurboshaftDeadCodeEliminationPhase {
 
   void Run(PipelineData* data, Zone* temp_zone) {
     DCHECK(data->HasTurboshaftGraph());
+    UnparkedScopeIfNeeded scope(data->broker(), DEBUG_BOOL);
 
     turboshaft::OptimizationPhase<turboshaft::DeadCodeEliminationReducer>::Run(
+        data->isolate(), &data->turboshaft_graph(), temp_zone,
+        data->node_origins());
+  }
+};
+
+struct TurboshaftTagUntagLoweringPhase {
+  DECL_PIPELINE_PHASE_CONSTANTS(TurboshaftTagUntagLowering)
+
+  void Run(PipelineData* data, Zone* temp_zone) {
+    DCHECK(data->HasTurboshaftGraph());
+    turboshaft::OptimizationPhase<turboshaft::TagUntagLoweringReducer>::Run(
         data->isolate(), &data->turboshaft_graph(), temp_zone,
         data->node_origins());
   }
@@ -2224,6 +2269,8 @@ struct WasmGCOptimizationPhase {
                                          temp_zone);
     WasmGCOperatorReducer wasm_gc(&graph_reducer, temp_zone, data->mcgraph(),
                                   module);
+    // Note: if we want to add DeadCodeElimination here, we'll have to update
+    // the existing reducers to handle kDead and kDeadValue nodes everywhere.
     AddReducer(data, &graph_reducer, &load_elimination);
     AddReducer(data, &graph_reducer, &wasm_gc);
     graph_reducer.ReduceGraph();
@@ -2795,6 +2842,21 @@ struct PrintTurboshaftGraphPhase {
             stream << static_cast<int>(graph.Get(index).saturated_use_count);
             return true;
           });
+#ifdef DEBUG
+      PrintTurboshaftCustomDataPerBlock(
+          data->info(), "Type Refinements", data->turboshaft_graph(),
+          [](std::ostream& stream, const turboshaft::Graph& graph,
+             turboshaft::BlockIndex index) -> bool {
+            const std::vector<std::pair<turboshaft::OpIndex, turboshaft::Type>>&
+                refinements = graph.block_type_refinement()[index];
+            if (refinements.empty()) return false;
+            stream << "\\n";
+            for (const auto& [op, type] : refinements) {
+              stream << op << " : " << type << "\\n";
+            }
+            return true;
+          });
+#endif  // DEBUG
     }
 
     if (data->info()->trace_turbo_graph()) {
@@ -3191,6 +3253,10 @@ bool PipelineImpl::OptimizeGraph(Linkage* linkage) {
     Run<PrintTurboshaftGraphPhase>(
         TurboshaftDeadCodeEliminationPhase::phase_name());
 
+    Run<TurboshaftTagUntagLoweringPhase>();
+    Run<PrintTurboshaftGraphPhase>(
+        TurboshaftTagUntagLoweringPhase::phase_name());
+
     Run<TurboshaftRecreateSchedulePhase>(linkage);
     TraceSchedule(data->info(), data, data->schedule(),
                   TurboshaftRecreateSchedulePhase::phase_name());
@@ -3473,10 +3539,10 @@ wasm::WasmCompilationResult Pipeline::GenerateCodeForWasmNativeStub(
 
   CodeGenerator* code_generator = pipeline.code_generator();
   wasm::WasmCompilationResult result;
-  code_generator->tasm()->GetCode(
+  code_generator->masm()->GetCode(
       nullptr, &result.code_desc, code_generator->safepoint_table_builder(),
       static_cast<int>(code_generator->handler_table_offset()));
-  result.instr_buffer = code_generator->tasm()->ReleaseBuffer();
+  result.instr_buffer = code_generator->masm()->ReleaseBuffer();
   result.source_positions = code_generator->GetSourcePositionTable();
   result.protected_instructions_data =
       code_generator->GetProtectedInstructionsData();
@@ -3702,11 +3768,11 @@ void Pipeline::GenerateCodeForWasmFunction(
 
   auto result = std::make_unique<wasm::WasmCompilationResult>();
   CodeGenerator* code_generator = pipeline.code_generator();
-  code_generator->tasm()->GetCode(
+  code_generator->masm()->GetCode(
       nullptr, &result->code_desc, code_generator->safepoint_table_builder(),
       static_cast<int>(code_generator->handler_table_offset()));
 
-  result->instr_buffer = code_generator->tasm()->ReleaseBuffer();
+  result->instr_buffer = code_generator->masm()->ReleaseBuffer();
   result->frame_slot_count = code_generator->frame()->GetTotalFrameSlotCount();
   result->tagged_parameter_slots = call_descriptor->GetTaggedParameterSlots();
   result->source_positions = code_generator->GetSourcePositionTable();
@@ -3771,6 +3837,7 @@ MaybeHandle<Code> Pipeline::GenerateCodeForTesting(
                                &zone_stats));
 
   PipelineData data(&zone_stats, isolate, info, pipeline_statistics.get());
+  PipelineJobScope scope(&data, isolate->counters()->runtime_call_stats());
   PipelineImpl pipeline(&data);
 
   Linkage linkage(Linkage::ComputeIncoming(data.instruction_zone(), info));
@@ -3821,6 +3888,7 @@ MaybeHandle<Code> Pipeline::GenerateCodeForTesting(
   PipelineData data(&zone_stats, info, isolate, isolate->allocator(), graph,
                     nullptr, schedule, nullptr, node_positions, nullptr,
                     options, nullptr);
+  PipelineJobScope scope(&data, isolate->counters()->runtime_call_stats());
   std::unique_ptr<PipelineStatistics> pipeline_statistics;
   if (v8_flags.turbo_stats || v8_flags.turbo_stats_nvp) {
     pipeline_statistics.reset(new PipelineStatistics(
@@ -4200,6 +4268,31 @@ MaybeHandle<Code> PipelineImpl::GenerateCode(CallDescriptor* call_descriptor) {
     return MaybeHandle<Code>();
   }
   return FinalizeCode();
+}
+
+// The CheckMaps node can migrate objects with deprecated maps. Afterwards, we
+// check the resulting object against a fixed list of maps known at compile
+// time. This is problematic if we made any assumptions about an object with the
+// deprecated map, as it now changed shape. Therefore, we want to avoid
+// embedding deprecated maps, as objects with these maps can be changed by
+// CheckMaps.
+// The following code only checks for deprecated maps at the end of compilation,
+// but doesn't protect us against the embedded maps becoming deprecated later.
+// However, this is enough, since if the map becomes deprecated later, it will
+// migrate to a new map not yet known at compile time, so if we migrate to it as
+// part of a CheckMaps, this check will always fail afterwards and deoptimize.
+// This in turn relies on a runtime invariant that map migrations always target
+// newly allocated maps.
+bool PipelineImpl::CheckNoDeprecatedMaps(Handle<Code> code) {
+  int mode_mask = RelocInfo::EmbeddedObjectModeMask();
+  for (RelocIterator it(*code, mode_mask); !it.done(); it.next()) {
+    DCHECK(RelocInfo::IsEmbeddedObjectMode(it.rinfo()->rmode()));
+    HeapObject obj = it.rinfo()->target_object(data_->isolate());
+    if (obj.IsMap() && Map::cast(obj).is_deprecated()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool PipelineImpl::CommitDependencies(Handle<Code> code) {

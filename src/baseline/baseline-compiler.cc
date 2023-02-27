@@ -439,8 +439,8 @@ void BaselineCompiler::LoadFeedbackVector(Register output) {
 
 void BaselineCompiler::LoadClosureFeedbackArray(Register output) {
   LoadFeedbackVector(output);
-  __ LoadTaggedPointerField(output, output,
-                            FeedbackVector::kClosureFeedbackCellArrayOffset);
+  __ LoadTaggedField(output, output,
+                     FeedbackVector::kClosureFeedbackCellArrayOffset);
 }
 
 void BaselineCompiler::SelectBooleanConstant(
@@ -561,8 +561,7 @@ void BaselineCompiler::VerifyFrame() {
       __ Move(scratch, __ FeedbackVectorOperand());
       Label is_smi, is_ok;
       __ JumpIfSmi(scratch, &is_smi);
-      __ JumpIfObjectType(kEqual, scratch, FEEDBACK_VECTOR_TYPE, scratch,
-                          &is_ok);
+      __ JumpIfObjectTypeFast(kEqual, scratch, FEEDBACK_VECTOR_TYPE, &is_ok);
       __ Bind(&is_smi);
       __ masm()->Abort(AbortReason::kExpectedFeedbackVector);
       __ Bind(&is_ok);
@@ -754,8 +753,8 @@ void BaselineCompiler::VisitLdaCurrentContextSlot() {
   BaselineAssembler::ScratchRegisterScope scratch_scope(&basm_);
   Register context = scratch_scope.AcquireScratch();
   __ LoadContext(context);
-  __ LoadTaggedAnyField(kInterpreterAccumulatorRegister, context,
-                        Context::OffsetOfElementAt(Index(0)));
+  __ LoadTaggedField(kInterpreterAccumulatorRegister, context,
+                     Context::OffsetOfElementAt(Index(0)));
 }
 
 void BaselineCompiler::VisitLdaImmutableCurrentContextSlot() {
@@ -1350,9 +1349,9 @@ void BaselineCompiler::VisitIntrinsicCreateJSGeneratorObject(
 void BaselineCompiler::VisitIntrinsicGeneratorGetResumeMode(
     interpreter::RegisterList args) {
   __ LoadRegister(kInterpreterAccumulatorRegister, args[0]);
-  __ LoadTaggedAnyField(kInterpreterAccumulatorRegister,
-                        kInterpreterAccumulatorRegister,
-                        JSGeneratorObject::kResumeModeOffset);
+  __ LoadTaggedField(kInterpreterAccumulatorRegister,
+                     kInterpreterAccumulatorRegister,
+                     JSGeneratorObject::kResumeModeOffset);
 }
 
 void BaselineCompiler::VisitIntrinsicGeneratorClose(
@@ -1561,9 +1560,8 @@ void BaselineCompiler::VisitTestTypeOf() {
     case interpreter::TestTypeOfFlags::LiteralFlag::kNumber: {
       Label is_smi, is_heap_number;
       __ JumpIfSmi(kInterpreterAccumulatorRegister, &is_smi, Label::kNear);
-      __ JumpIfObjectType(kEqual, kInterpreterAccumulatorRegister,
-                          HEAP_NUMBER_TYPE, scratch_scope.AcquireScratch(),
-                          &is_heap_number, Label::kNear);
+      __ JumpIfObjectTypeFast(kEqual, kInterpreterAccumulatorRegister,
+                              HEAP_NUMBER_TYPE, &is_heap_number, Label::kNear);
 
       __ LoadRoot(kInterpreterAccumulatorRegister, RootIndex::kFalseValue);
       __ Jump(&done, Label::kNear);
@@ -1592,9 +1590,8 @@ void BaselineCompiler::VisitTestTypeOf() {
     case interpreter::TestTypeOfFlags::LiteralFlag::kSymbol: {
       Label is_smi, bad_instance_type;
       __ JumpIfSmi(kInterpreterAccumulatorRegister, &is_smi, Label::kNear);
-      __ JumpIfObjectType(kNotEqual, kInterpreterAccumulatorRegister,
-                          SYMBOL_TYPE, scratch_scope.AcquireScratch(),
-                          &bad_instance_type, Label::kNear);
+      __ JumpIfObjectTypeFast(kNotEqual, kInterpreterAccumulatorRegister,
+                              SYMBOL_TYPE, &bad_instance_type, Label::kNear);
 
       __ LoadRoot(kInterpreterAccumulatorRegister, RootIndex::kTrueValue);
       __ Jump(&done, Label::kNear);
@@ -1622,9 +1619,8 @@ void BaselineCompiler::VisitTestTypeOf() {
     case interpreter::TestTypeOfFlags::LiteralFlag::kBigInt: {
       Label is_smi, bad_instance_type;
       __ JumpIfSmi(kInterpreterAccumulatorRegister, &is_smi, Label::kNear);
-      __ JumpIfObjectType(kNotEqual, kInterpreterAccumulatorRegister,
-                          BIGINT_TYPE, scratch_scope.AcquireScratch(),
-                          &bad_instance_type, Label::kNear);
+      __ JumpIfObjectTypeFast(kNotEqual, kInterpreterAccumulatorRegister,
+                              BIGINT_TYPE, &bad_instance_type, Label::kNear);
 
       __ LoadRoot(kInterpreterAccumulatorRegister, RootIndex::kTrueValue);
       __ Jump(&done, Label::kNear);
@@ -1900,6 +1896,7 @@ void BaselineCompiler::VisitCreateRestParameter() {
 }
 
 void BaselineCompiler::VisitJumpLoop() {
+#ifndef V8_JITLESS
   Label osr_armed, osr_not_armed;
   using D = OnStackReplacementDescriptor;
   Register feedback_vector = Register::no_reg();
@@ -1920,6 +1917,7 @@ void BaselineCompiler::VisitJumpLoop() {
   }
 
   __ Bind(&osr_not_armed);
+#endif  // !V8_JITLESS
   Label* label = labels_[iterator().GetJumpTargetOffset()].GetPointer();
   int weight = iterator().GetRelativeJumpTargetOffset() -
                iterator().current_bytecode_size_without_prefix();
@@ -1928,6 +1926,7 @@ void BaselineCompiler::VisitJumpLoop() {
   DCHECK(label->is_bound());
   UpdateInterruptBudgetAndJumpToLabel(weight, label, label);
 
+#ifndef V8_JITLESS
   {
     ASM_CODE_COMMENT_STRING(&masm_, "OSR Handle Armed");
     __ Bind(&osr_armed);
@@ -1950,6 +1949,7 @@ void BaselineCompiler::VisitJumpLoop() {
     CallBuiltin<Builtin::kBaselineOnStackReplacement>(maybe_target_code);
     __ Jump(&osr_not_armed, Label::kNear);
   }
+#endif  // !V8_JITLESS
 }
 
 void BaselineCompiler::VisitJump() {
@@ -2046,9 +2046,8 @@ void BaselineCompiler::VisitJumpIfJSReceiver() {
   Label is_smi, dont_jump;
   __ JumpIfSmi(kInterpreterAccumulatorRegister, &is_smi, Label::kNear);
 
-  __ JumpIfObjectType(kLessThan, kInterpreterAccumulatorRegister,
-                      FIRST_JS_RECEIVER_TYPE, scratch_scope.AcquireScratch(),
-                      &dont_jump);
+  __ JumpIfObjectTypeFast(kLessThan, kInterpreterAccumulatorRegister,
+                          FIRST_JS_RECEIVER_TYPE, &dont_jump);
   UpdateInterruptBudgetAndDoInterpreterJump();
 
   __ Bind(&is_smi);
@@ -2211,8 +2210,8 @@ void BaselineCompiler::VisitSwitchOnGeneratorState() {
       Smi::FromInt(JSGeneratorObject::kGeneratorExecuting));
 
   Register context = scratch_scope.AcquireScratch();
-  __ LoadTaggedAnyField(context, generator_object,
-                        JSGeneratorObject::kContextOffset);
+  __ LoadTaggedField(context, generator_object,
+                     JSGeneratorObject::kContextOffset);
   __ StoreContext(context);
 
   interpreter::JumpTableTargetOffsets offsets =

@@ -43,6 +43,7 @@
 #include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/js-array-inl.h"
 #include "src/objects/js-atomics-synchronization.h"
+#include "src/objects/js-iterator-helpers.h"
 #ifdef V8_INTL_SUPPORT
 #include "src/objects/js-break-iterator.h"
 #include "src/objects/js-collator.h"
@@ -3466,6 +3467,14 @@ void Genesis::InitializeGlobal(Handle<JSGlobalObject> global_object,
 
     InstallToStringTag(isolate_, prototype, "DataView");
 
+    // Setup objects needed for the JSRabGsabDataView.
+    Handle<Map> rab_gsab_data_view_map = factory->NewMap(
+        JS_RAB_GSAB_DATA_VIEW_TYPE, JSDataView::kSizeWithEmbedderFields,
+        TERMINAL_FAST_ELEMENTS_KIND);
+    Map::SetPrototype(isolate(), rab_gsab_data_view_map, prototype);
+    rab_gsab_data_view_map->SetConstructor(*data_view_fun);
+    native_context()->set_js_rab_gsab_data_view_map(*rab_gsab_data_view_map);
+
     // Install the "buffer", "byteOffset" and "byteLength" getters
     // on the {prototype}.
     SimpleInstallGetter(isolate_, prototype, factory->buffer_string(),
@@ -4523,6 +4532,46 @@ EMPTY_INITIALIZE_GLOBAL_FOR_FEATURE(harmony_intl_best_fit_matcher)
 
 #undef EMPTY_INITIALIZE_GLOBAL_FOR_FEATURE
 
+void Genesis::InitializeGlobal_harmony_iterator_helpers() {
+  if (!v8_flags.harmony_iterator_helpers) return;
+
+  Handle<JSObject> iterator_prototype(
+      native_context()->initial_iterator_prototype(), isolate());
+
+  // --- %IteratorHelperPrototype%
+  Handle<JSObject> iterator_helper_prototype = factory()->NewJSObject(
+      isolate()->object_function(), AllocationType::kOld);
+  JSObject::ForceSetPrototype(isolate(), iterator_helper_prototype,
+                              iterator_prototype);
+  InstallToStringTag(isolate(), iterator_helper_prototype, "Iterator Helper");
+  SimpleInstallFunction(isolate(), iterator_helper_prototype, "next",
+                        Builtin::kIteratorHelperPrototypeNext, 0, true);
+  SimpleInstallFunction(isolate(), iterator_helper_prototype, "return",
+                        Builtin::kIteratorHelperPrototypeReturn, 0, true);
+
+  // --- Helper maps
+#define INSTALL_ITERATOR_HELPER(lowercase_name, Capitalized_name,              \
+                                ALL_CAPS_NAME, argc)                           \
+  {                                                                            \
+    Handle<Map> map =                                                          \
+        factory()->NewMap(JS_ITERATOR_##ALL_CAPS_NAME##_HELPER_TYPE,           \
+                          JSIterator##Capitalized_name##Helper::kHeaderSize,   \
+                          TERMINAL_FAST_ELEMENTS_KIND, 0);                     \
+    Map::SetPrototype(isolate(), map, iterator_helper_prototype);              \
+    native_context()->set_iterator_##lowercase_name##_helper_map(*map);        \
+    SimpleInstallFunction(isolate(), iterator_prototype, #lowercase_name,      \
+                          Builtin::kIteratorPrototype##Capitalized_name, argc, \
+                          true);                                               \
+  }
+
+#define ITERATOR_HELPERS(V) V(map, Map, MAP, 1)
+
+  ITERATOR_HELPERS(INSTALL_ITERATOR_HELPER)
+
+#undef INSTALL_ITERATOR_HELPER
+#undef ITERATOR_HELPERS
+}
+
 void Genesis::InitializeGlobal_harmony_json_parse_with_source() {
   if (!v8_flags.harmony_json_parse_with_source) return;
   Handle<Map> map = factory()->NewMap(JS_RAW_JSON_TYPE, JSRawJson::kSize,
@@ -4704,7 +4753,7 @@ void Genesis::InitializeGlobal_harmony_struct() {
         isolate()->factory()->NewDescriptorArray(1, 0,
                                                  AllocationType::kSharedOld);
     Descriptor length_descriptor = Descriptor::DataField(
-        isolate()->shared_heap_isolate()->factory()->length_string(),
+        isolate()->shared_space_isolate()->factory()->length_string(),
         JSSharedArray::kLengthFieldIndex, ALL_ATTRIBUTES_MASK,
         PropertyConstness::kConst, Representation::Smi(),
         MaybeObjectHandle(FieldType::Any(isolate())));
@@ -4855,6 +4904,12 @@ void Genesis::InitializeGlobal_harmony_rab_gsab() {
   if (v8_flags.harmony_rab_gsab_transfer) {
     SimpleInstallFunction(isolate(), array_buffer_prototype, "transfer",
                           Builtin::kArrayBufferPrototypeTransfer, 0, false);
+    SimpleInstallFunction(
+        isolate(), array_buffer_prototype, "transferToFixedLength",
+        Builtin::kArrayBufferPrototypeTransferToFixedLength, 0, false);
+    SimpleInstallGetter(isolate(), array_buffer_prototype,
+                        factory()->detached_string(),
+                        Builtin::kArrayBufferPrototypeGetDetached, false);
   }
 
   Handle<JSObject> shared_array_buffer_prototype(

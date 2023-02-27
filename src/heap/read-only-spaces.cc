@@ -190,7 +190,7 @@ ReadOnlyHeap* PointerCompressedReadOnlyArtifacts::GetReadOnlyHeapForIsolate(
     Address original_address = original_object.ptr();
     Address new_address =
         isolate_root +
-        V8HeapCompressionScheme::CompressTagged(original_address);
+        V8HeapCompressionScheme::CompressObject(original_address);
     Object new_object = Object(new_address);
     cache.push_back(new_object);
   }
@@ -241,7 +241,7 @@ void PointerCompressedReadOnlyArtifacts::Initialize(
     shared_memory_.push_back(std::move(shared_memory));
     // This is just CompressTagged but inlined so it will always compile.
     Tagged_t compressed_address =
-        V8HeapCompressionScheme::CompressTagged(page->address());
+        V8HeapCompressionScheme::CompressAny(page->address());
     page_offsets_.push_back(compressed_address);
 
     // 3. Update the accounting stats so the allocated bytes are for the new
@@ -338,7 +338,6 @@ ReadOnlyPage::ReadOnlyPage(Heap* heap, BaseSpace* space, size_t chunk_size,
                        std::move(reservation)) {
   allocated_bytes_ = 0;
   SetFlags(Flag::NEVER_EVACUATE | Flag::READ_ONLY_HEAP);
-  heap->non_atomic_marking_state()->bitmap(this)->MarkAllBits();
 }
 
 void ReadOnlyPage::MakeHeaderRelocatable() {
@@ -545,11 +544,6 @@ void ReadOnlySpace::FreeLinearAllocationArea() {
     return;
   }
 
-  // Clear the bits in the unused black area.
-  ReadOnlyPage* page = pages_.back();
-  heap()->marking_state()->bitmap(page)->ClearRange(
-      page->AddressToMarkbitIndex(top_), page->AddressToMarkbitIndex(limit_));
-
   heap()->CreateFillerObjectAt(top_, static_cast<int>(limit_ - top_));
 
   BasicMemoryChunk::UpdateHighWaterMark(top_);
@@ -662,15 +656,9 @@ AllocationResult ReadOnlySpace::AllocateRawUnaligned(int size_in_bytes) {
 
 AllocationResult ReadOnlySpace::AllocateRaw(int size_in_bytes,
                                             AllocationAlignment alignment) {
-  AllocationResult result =
-      USE_ALLOCATION_ALIGNMENT_BOOL && alignment != kTaggedAligned
-          ? AllocateRawAligned(size_in_bytes, alignment)
-          : AllocateRawUnaligned(size_in_bytes);
-  HeapObject heap_obj;
-  if (result.To(&heap_obj)) {
-    DCHECK(heap()->marking_state()->IsBlack(heap_obj));
-  }
-  return result;
+  return USE_ALLOCATION_ALIGNMENT_BOOL && alignment != kTaggedAligned
+             ? AllocateRawAligned(size_in_bytes, alignment)
+             : AllocateRawUnaligned(size_in_bytes);
 }
 
 size_t ReadOnlyPage::ShrinkToHighWaterMark() {

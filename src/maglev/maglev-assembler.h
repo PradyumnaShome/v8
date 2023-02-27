@@ -7,6 +7,7 @@
 
 #include "src/codegen/machine-type.h"
 #include "src/codegen/macro-assembler.h"
+#include "src/common/globals.h"
 #include "src/flags/flags.h"
 #include "src/interpreter/bytecode-flags.h"
 #include "src/maglev/maglev-code-gen-state.h"
@@ -68,7 +69,7 @@ class MaglevAssembler : public MacroAssembler {
   template <typename Dest, typename Source>
   inline void MoveRepr(MachineRepresentation repr, Dest dst, Source src);
 
-  void Allocate(RegisterSnapshot& register_snapshot, Register result,
+  void Allocate(RegisterSnapshot register_snapshot, Register result,
                 int size_in_bytes,
                 AllocationType alloc_type = AllocationType::kYoung,
                 AllocationAlignment alignment = kTaggedAligned);
@@ -98,6 +99,13 @@ class MaglevAssembler : public MacroAssembler {
 
   Register FromAnyToRegister(const Input& input, Register scratch);
 
+  inline void LoadTaggedField(Register result, MemOperand operand);
+  inline void LoadTaggedField(Register result, Register object, int offset);
+  inline void LoadTaggedSignedField(Register result, MemOperand operand);
+  inline void LoadTaggedSignedField(Register result, Register object,
+                                    int offset);
+  inline void LoadTaggedFieldByIndex(Register result, Register object,
+                                     Register index, int scale, int offset);
   inline void LoadBoundedSizeFromObject(Register result, Register object,
                                         int offset);
   inline void LoadExternalPointerField(Register result, MemOperand operand);
@@ -144,18 +152,17 @@ class MaglevAssembler : public MacroAssembler {
 
   inline void DoubleToInt64Repr(Register dst, DoubleRegister src);
   void TruncateDoubleToInt32(Register dst, DoubleRegister src);
+  void TryTruncateDoubleToInt32(Register dst, DoubleRegister src, Label* fail);
 
   inline void DefineLazyDeoptPoint(LazyDeoptInfo* info);
   inline void DefineExceptionHandlerPoint(NodeBase* node);
   inline void DefineExceptionHandlerAndLazyDeoptPoint(NodeBase* node);
 
   template <typename Function, typename... Args>
-  inline DeferredCodeInfo* PushDeferredCode(Function&& deferred_code_gen,
-                                            Args&&... args);
+  inline Label* MakeDeferredCode(Function&& deferred_code_gen, Args&&... args);
   template <typename Function, typename... Args>
   inline void JumpToDeferredIf(Condition cond, Function&& deferred_code_gen,
                                Args&&... args);
-
   template <typename NodeT>
   inline Label* GetDeoptLabel(NodeT* node, DeoptimizeReason reason);
   template <typename NodeT>
@@ -184,16 +191,19 @@ class MaglevAssembler : public MacroAssembler {
   inline void Move(Register dst, TaggedIndex i);
   inline void Move(Register dst, int32_t i);
   inline void Move(DoubleRegister dst, double n);
+  inline void Move(DoubleRegister dst, Float64 n);
   inline void Move(Register dst, Handle<HeapObject> obj);
 
   inline void LoadByte(Register dst, MemOperand src);
 
   inline void SignExtend32To64Bits(Register dst, Register src);
+  inline void NegateInt32(Register val);
 
   template <typename NodeT>
   inline void DeoptIfBufferDetached(Register array, Register scratch,
                                     NodeT* node);
 
+  inline void IsObjectType(Register heap_object, InstanceType type);
   inline void CompareObjectType(Register heap_object, InstanceType type);
   inline void CompareObjectType(Register heap_object, InstanceType type,
                                 Register scratch);
@@ -201,10 +211,18 @@ class MaglevAssembler : public MacroAssembler {
                                      InstanceType lower_limit,
                                      InstanceType higher_limit);
 
+  inline void CompareInstanceTypeRange(Register map, InstanceType lower_limit,
+                                       InstanceType higher_limit);
+  inline void CompareInstanceTypeRange(Register map, Register instance_type_out,
+                                       InstanceType lower_limit,
+                                       InstanceType higher_limit);
+
   inline void CompareTagged(Register reg, Handle<HeapObject> obj);
 
   inline void CompareInt32(Register reg, int32_t imm);
   inline void CompareInt32(Register src1, Register src2);
+
+  inline void CallSelf();
 
   inline void Jump(Label* target, Label::Distance distance = Label::kFar);
   inline void JumpIf(Condition cond, Label* target,
@@ -222,6 +240,17 @@ class MaglevAssembler : public MacroAssembler {
   inline void CompareInt32AndJumpIf(Register r1, Register r2, Condition cond,
                                     Label* target,
                                     Label::Distance distance = Label::kFar);
+  inline void CompareInt32AndJumpIf(Register r1, int32_t value, Condition cond,
+                                    Label* target,
+                                    Label::Distance distance = Label::kFar);
+  inline void CompareSmiAndJumpIf(Register r1, Smi value, Condition cond,
+                                  Label* target,
+                                  Label::Distance distance = Label::kFar);
+  inline void TestInt32AndJumpIfAnySet(Register r1, int32_t mask, Label* target,
+                                       Label::Distance distance = Label::kFar);
+  inline void TestInt32AndJumpIfAllClear(
+      Register r1, int32_t mask, Label* target,
+      Label::Distance distance = Label::kFar);
 
   inline void Int32ToDouble(DoubleRegister result, Register n);
   inline void SmiToDouble(DoubleRegister result, Register smi);

@@ -95,7 +95,7 @@ struct ArrayBufferSweeper::SweepingJob final {
   ArrayBufferList young_;
   ArrayBufferList old_;
   const SweepingType type_;
-  std::atomic<size_t> freed_bytes_{0};
+  size_t freed_bytes_{0};
 
   friend class ArrayBufferSweeper;
 };
@@ -172,6 +172,10 @@ void ArrayBufferSweeper::RequestSweep(SweepingType type) {
     job_->id_ = task->id();
     V8::GetCurrentPlatform()->CallOnWorkerThread(std::move(task));
   } else {
+    GCTracer::Scope::ScopeId scope_id =
+        type == SweepingType::kYoung ? GCTracer::Scope::YOUNG_ARRAY_BUFFER_SWEEP
+                                     : GCTracer::Scope::FULL_ARRAY_BUFFER_SWEEP;
+    TRACE_GC_EPOCH(heap_->tracer(), scope_id, ThreadKind::kMain);
     DoSweep();
     Finalize();
   }
@@ -207,9 +211,7 @@ void ArrayBufferSweeper::Finalize() {
   CHECK_EQ(job_->state_, SweepingState::kDone);
   young_.Append(&job_->young_);
   old_.Append(&job_->old_);
-  const size_t freed_bytes =
-      job_->freed_bytes_.exchange(0, std::memory_order_relaxed);
-  DecrementExternalMemoryCounters(freed_bytes);
+  DecrementExternalMemoryCounters(job_->freed_bytes_);
 
   local_sweeper_.Finalize();
 
@@ -244,16 +246,18 @@ void ArrayBufferSweeper::Append(JSArrayBuffer object,
 
 void ArrayBufferSweeper::Detach(JSArrayBuffer object,
                                 ArrayBufferExtension* extension) {
+  // Finish sweeping here first such that the code below is guaranteed to
+  // observe the same sweeping state.
+  FinishIfDone();
+
   size_t bytes = extension->ClearAccountingLength();
 
   // We cannot free the extension eagerly here, since extensions are tracked in
   // a singly linked list. The next GC will remove it automatically.
 
-  FinishIfDone();
-
   if (!sweeping_in_progress()) {
     // If concurrent sweeping isn't running at the moment, we can also adjust
-    // the respective bytes in the corresponding ArraybufferLists as they are
+    // the respective bytes in the corresponding ArrayBufferLists as they are
     // only approximate.
     if (Heap::InYoungGeneration(object)) {
       DCHECK_GE(young_.bytes_, bytes);
@@ -317,7 +321,7 @@ ArrayBufferList ArrayBufferSweeper::SweepingJob::SweepListFull(
     if (!current->IsMarked()) {
       const size_t bytes = current->accounting_length();
       delete current;
-      if (bytes) freed_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+      if (bytes) freed_bytes_ += bytes;
     } else {
       current->Unmark();
       survivor_list.Append(current);
@@ -343,7 +347,7 @@ void ArrayBufferSweeper::SweepingJob::SweepYoung() {
     if (!current->IsYoungMarked()) {
       size_t bytes = current->accounting_length();
       delete current;
-      if (bytes) freed_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+      if (bytes) freed_bytes_ += bytes;
     } else if (current->IsYoungPromoted()) {
       current->YoungUnmark();
       new_old.Append(current);

@@ -50,6 +50,7 @@ static const char pauseOnExceptionsState[] = "pauseOnExceptionsState";
 static const char asyncCallStackDepth[] = "asyncCallStackDepth";
 static const char blackboxPattern[] = "blackboxPattern";
 static const char debuggerEnabled[] = "debuggerEnabled";
+static const char breakpointsActiveWhenEnabled[] = "breakpointsActive";
 static const char skipAllPauses[] = "skipAllPauses";
 
 static const char breakpointsByRegex[] = "breakpointsByRegex";
@@ -446,9 +447,11 @@ void V8DebuggerAgentImpl::enableImpl() {
     didParseSource(std::move(script), true);
   }
 
-  m_breakpointsActive = true;
-  m_debugger->setBreakpointsActive(true);
-
+  m_breakpointsActive = m_state->booleanProperty(
+      DebuggerAgentState::breakpointsActiveWhenEnabled, true);
+  if (m_breakpointsActive) {
+    m_debugger->setBreakpointsActive(true);
+  }
   if (isPaused()) {
     didPause(0, v8::Local<v8::Value>(), std::vector<v8::debug::BreakpointId>(),
              v8::debug::kException, false,
@@ -498,7 +501,7 @@ Response V8DebuggerAgentImpl::disable() {
   m_cachedScripts.clear();
   m_cachedScriptSize = 0;
   for (const auto& it : m_debuggerBreakpointIdToBreakpointId) {
-    v8::debug::RemoveBreakpoint(m_isolate, it.first);
+    m_debugger->removeBreakpoint(it.first);
   }
   m_breakpointIdToDebuggerBreakpointIds.clear();
   m_debuggerBreakpointIdToBreakpointId.clear();
@@ -544,7 +547,8 @@ void V8DebuggerAgentImpl::restore() {
 }
 
 Response V8DebuggerAgentImpl::setBreakpointsActive(bool active) {
-  if (!enabled()) return Response::ServerError(kDebuggerNotEnabled);
+  m_state->setBoolean(DebuggerAgentState::breakpointsActiveWhenEnabled, active);
+  if (!enabled()) return Response::Success();
   if (m_breakpointsActive == active) return Response::Success();
   m_breakpointsActive = active;
   m_debugger->setBreakpointsActive(active);
@@ -815,7 +819,7 @@ void V8DebuggerAgentImpl::removeBreakpointImpl(
       script->removeWasmBreakpoint(id);
     }
 #endif  // V8_ENABLE_WEBASSEMBLY
-    v8::debug::RemoveBreakpoint(m_isolate, id);
+    m_debugger->removeBreakpoint(id);
     m_debuggerBreakpointIdToBreakpointId.erase(id);
   }
   m_breakpointIdToDebuggerBreakpointIds.erase(breakpointId);
@@ -1081,6 +1085,9 @@ const char* buildStatus(v8::debug::LiveEditResult::Status status) {
     case v8::debug::LiveEditResult::BLOCKED_BY_RUNNING_GENERATOR:
       return protocol::Debugger::SetScriptSource::StatusEnum::
           BlockedByActiveGenerator;
+    case v8::debug::LiveEditResult::BLOCKED_BY_TOP_LEVEL_ES_MODULE_CHANGE:
+      return protocol::Debugger::SetScriptSource::StatusEnum::
+          BlockedByTopLevelEsModuleChange;
   }
 }
 }  // namespace

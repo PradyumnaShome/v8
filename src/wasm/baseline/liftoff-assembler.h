@@ -98,7 +98,7 @@ class FreezeCacheState {
 #endif
 };
 
-class LiftoffAssembler : public TurboAssembler {
+class LiftoffAssembler : public MacroAssembler {
  public:
   // Each slot in our stack frame currently has exactly 8 bytes.
   static constexpr int kStackSlotSize = 8;
@@ -211,8 +211,10 @@ class LiftoffAssembler : public TurboAssembler {
   ASSERT_TRIVIALLY_COPYABLE(VarState);
 
   struct CacheState {
-    // Allow default construction, move construction, and move assignment.
-    CacheState() = default;
+    explicit CacheState(Zone* zone)
+        : stack_state(ZoneAllocator<VarState>{zone}) {}
+
+    // Allow move construction and move assignment.
     CacheState(CacheState&&) V8_NOEXCEPT = default;
     CacheState& operator=(CacheState&&) V8_NOEXCEPT = default;
     // Disallow copy construction.
@@ -238,7 +240,7 @@ class LiftoffAssembler : public TurboAssembler {
 
     // TODO(jkummerow): Wrap all accesses to {stack_state} in accessors that
     // check {frozen}.
-    base::SmallVector<VarState, 16> stack_state;
+    base::SmallVector<VarState, 16, ZoneAllocator<VarState>> stack_state;
     LiftoffRegList used_registers;
     uint32_t register_use_count[kAfterMaxLiftoffRegCode] = {0};
     LiftoffRegList last_spilled_regs;
@@ -258,7 +260,6 @@ class LiftoffAssembler : public TurboAssembler {
             kFpCacheRegList.MaskOut(used_registers).MaskOut(pinned);
         return available_regs.HasAdjacentFpRegsSet();
       }
-      DCHECK(rc == kGpReg || rc == kFpReg);
       LiftoffRegList candidates = GetCacheRegList(rc);
       return has_unused_register(candidates.MaskOut(pinned));
     }
@@ -282,7 +283,6 @@ class LiftoffAssembler : public TurboAssembler {
         DCHECK(is_free(LiftoffRegister::ForFpPair(low)));
         return LiftoffRegister::ForFpPair(low);
       }
-      DCHECK(rc == kGpReg || rc == kFpReg);
       LiftoffRegList candidates = GetCacheRegList(rc);
       return unused_register(candidates, pinned);
     }
@@ -453,11 +453,7 @@ class LiftoffAssembler : public TurboAssembler {
       return reg;
     }
 
-    // TODO(clemensb): Don't copy the full parent state (this makes us N^2).
-    void InitMerge(const CacheState& source, uint32_t num_locals,
-                   uint32_t arity, uint32_t stack_depth);
-
-    void Steal(const CacheState& source);
+    void Steal(CacheState& source);
 
     void Split(const CacheState& source);
 
@@ -470,18 +466,37 @@ class LiftoffAssembler : public TurboAssembler {
     CacheState& operator=(const CacheState&) V8_NOEXCEPT = default;
   };
 
-  explicit LiftoffAssembler(std::unique_ptr<AssemblerBuffer>);
+  explicit LiftoffAssembler(Zone*, std::unique_ptr<AssemblerBuffer>);
   ~LiftoffAssembler() override;
 
-  LiftoffRegister LoadToRegister(VarState slot, LiftoffRegList pinned);
+  Zone* zone() const { return cache_state_.stack_state.get_allocator().zone(); }
 
-  LiftoffRegister LoadToRegister(VarState slot, LiftoffRegister dst);
+  // Load a cache slot to a free register.
+  V8_INLINE LiftoffRegister LoadToRegister(VarState slot,
+                                           LiftoffRegList pinned) {
+    if (V8_LIKELY(slot.is_reg())) return slot.reg();
+    return LoadToRegister_Slow(slot, pinned);
+  }
 
-  LiftoffRegister PopToRegister(LiftoffRegList pinned = {}) {
+  // Slow path called for the method above.
+  V8_NOINLINE V8_PRESERVE_MOST LiftoffRegister
+  LoadToRegister_Slow(VarState slot, LiftoffRegList pinned);
+
+  // Load a non-register cache slot to a given (fixed) register.
+  void LoadToFixedRegister(VarState slot, LiftoffRegister reg) {
+    DCHECK(slot.is_const() || slot.is_stack());
+    if (slot.is_const()) {
+      LoadConstant(reg, slot.constant());
+    } else {
+      Fill(reg, slot.offset(), slot.kind());
+    }
+  }
+
+  V8_INLINE LiftoffRegister PopToRegister(LiftoffRegList pinned = {}) {
     DCHECK(!cache_state_.stack_state.empty());
     VarState slot = cache_state_.stack_state.back();
     cache_state_.stack_state.pop_back();
-    if (slot.is_reg()) {
+    if (V8_LIKELY(slot.is_reg())) {
       cache_state_.dec_used(slot.reg());
       return slot.reg();
     }
@@ -492,7 +507,7 @@ class LiftoffAssembler : public TurboAssembler {
     DCHECK(!cache_state_.stack_state.empty());
     VarState slot = cache_state_.stack_state.back();
     cache_state_.stack_state.pop_back();
-    if (slot.is_reg()) {
+    if (V8_LIKELY(slot.is_reg())) {
       cache_state_.dec_used(slot.reg());
       if (slot.reg() == reg) return;
       if (cache_state_.is_used(reg)) SpillRegister(reg);
@@ -500,7 +515,7 @@ class LiftoffAssembler : public TurboAssembler {
       return;
     }
     if (cache_state_.is_used(reg)) SpillRegister(reg);
-    LoadToRegister(slot, reg);
+    LoadToFixedRegister(slot, reg);
   }
 
   // Use this to pop a value into a register that has no other uses, so it
@@ -528,9 +543,11 @@ class LiftoffAssembler : public TurboAssembler {
 
   void DropValues(int count);
 
-  // Careful: this indexes "from the other end", i.e. depth=0 is the value
-  // at the bottom of the stack!
-  void DropValue(int depth);
+  // Drop a specific value from the stack; this is an expensive operation which
+  // is currently only used for exceptions.
+  // Careful: this indexes "from the other end", i.e. offset=0 is the value at
+  // the bottom of the stack.
+  void DropExceptionValueAtOffset(int offset);
 
   // Ensure that the loop inputs are either in a register or spilled to the
   // stack, so that we can merge different values on the back-edge.
@@ -580,7 +597,7 @@ class LiftoffAssembler : public TurboAssembler {
     cache_state_.stack_state.emplace_back(kind, NextSpillOffset(kind));
   }
 
-  void SpillRegister(LiftoffRegister);
+  V8_NOINLINE V8_PRESERVE_MOST void SpillRegister(LiftoffRegister);
 
   uint32_t GetNumUses(LiftoffRegister reg) const {
     return cache_state_.get_use_count(reg);
@@ -616,7 +633,6 @@ class LiftoffAssembler : public TurboAssembler {
       DoubleRegister low_fp = SpillAdjacentFpRegisters(pinned).fp();
       return LiftoffRegister::ForFpPair(low_fp);
     }
-    DCHECK(rc == kGpReg || rc == kFpReg);
     LiftoffRegList candidates = GetCacheRegList(rc).MaskOut(pinned);
     return GetUnusedRegister(candidates);
   }
@@ -625,11 +641,8 @@ class LiftoffAssembler : public TurboAssembler {
   LiftoffRegister GetUnusedRegister(LiftoffRegList candidates) {
     DCHECK(!cache_state_.frozen);
     DCHECK(!candidates.is_empty());
-    if (cache_state_.has_unused_register(candidates)) {
+    if (V8_LIKELY(cache_state_.has_unused_register(candidates))) {
       return cache_state_.unused_register(candidates);
-    }
-    if (cache_state_.has_volatile_register(candidates)) {
-      return cache_state_.take_volatile_register(candidates);
     }
     return SpillOneRegister(candidates);
   }
@@ -639,8 +652,15 @@ class LiftoffAssembler : public TurboAssembler {
   // avoids making each subsequent (conditional) branch repeat this work.
   void PrepareForBranch(uint32_t arity, LiftoffRegList pinned);
 
-  enum JumpDirection { kForwardJump, kBackwardJump };
+  // These methods handle control-flow merges. {MergeIntoNewState} is used to
+  // generate a new {CacheState} for a merge point, and also emits code to
+  // transfer values from the current state to the new merge state.
+  // {MergeFullStackWith} and {MergeStackWith} then later generate the code for
+  // more merges into an existing state.
+  V8_NODISCARD CacheState MergeIntoNewState(uint32_t num_locals, uint32_t arity,
+                                            uint32_t stack_depth);
   void MergeFullStackWith(CacheState& target);
+  enum JumpDirection { kForwardJump, kBackwardJump };
   void MergeStackWith(CacheState& target, uint32_t arity, JumpDirection);
 
   void Spill(VarState* slot);
@@ -717,8 +737,12 @@ class LiftoffAssembler : public TurboAssembler {
     ParallelRegisterMove(base::VectorOf(moves));
   }
 
-  void MoveToReturnLocations(const FunctionSig*,
-                             compiler::CallDescriptor* descriptor);
+  // Move the top stack values into the expected return locations specified by
+  // the given call descriptor.
+  void MoveToReturnLocations(const FunctionSig*, compiler::CallDescriptor*);
+  // Slow path for multi-return, called from {MoveToReturnLocations}.
+  V8_NOINLINE V8_PRESERVE_MOST void MoveToReturnLocationsMultiReturn(
+      const FunctionSig*, compiler::CallDescriptor*);
 #if DEBUG
   void SetCacheStateFrozen() { cache_state_.frozen++; }
   void UnfreezeCacheState() {
@@ -1652,7 +1676,9 @@ class LiftoffAssembler : public TurboAssembler {
  private:
   LiftoffRegister LoadI64HalfIntoRegister(VarState slot, RegPairHalf half);
 
-  V8_NOINLINE LiftoffRegister SpillOneRegister(LiftoffRegList candidates);
+  // Spill one of the candidate registers.
+  V8_NOINLINE V8_PRESERVE_MOST LiftoffRegister
+  SpillOneRegister(LiftoffRegList candidates);
   // Spill one or two fp registers to get a pair of adjacent fp registers.
   LiftoffRegister SpillAdjacentFpRegisters(LiftoffRegList pinned);
 

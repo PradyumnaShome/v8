@@ -233,7 +233,7 @@ class WasmGraphBuildingInterface {
         DCHECK(type.is_reference());
         // TODO(jkummerow): Consider using "the hole" instead, to make any
         // illegal uses more obvious.
-        node = builder_->SetType(builder_->RefNull(), type);
+        node = builder_->SetType(builder_->RefNull(type), type);
       } else {
         node = builder_->SetType(builder_->DefaultValue(type), type);
       }
@@ -444,8 +444,8 @@ class WasmGraphBuildingInterface {
 
   void UnOp(FullDecoder* decoder, WasmOpcode opcode, const Value& value,
             Value* result) {
-    SetAndTypeNode(result,
-                   builder_->Unop(opcode, value.node, decoder->position()));
+    SetAndTypeNode(result, builder_->Unop(opcode, value.node, value.type,
+                                          decoder->position()));
   }
 
   void BinOp(FullDecoder* decoder, WasmOpcode opcode, const Value& lhs,
@@ -481,7 +481,7 @@ class WasmGraphBuildingInterface {
   }
 
   void RefNull(FullDecoder* decoder, ValueType type, Value* result) {
-    SetAndTypeNode(result, builder_->RefNull());
+    SetAndTypeNode(result, builder_->RefNull(type));
   }
 
   void RefFunc(FullDecoder* decoder, uint32_t function_index, Value* result) {
@@ -489,7 +489,8 @@ class WasmGraphBuildingInterface {
   }
 
   void RefAsNonNull(FullDecoder* decoder, const Value& arg, Value* result) {
-    TFNode* cast_node = builder_->AssertNotNull(arg.node, decoder->position());
+    TFNode* cast_node =
+        builder_->AssertNotNull(arg.node, arg.type, decoder->position());
     SetAndTypeNode(result, cast_node);
   }
 
@@ -539,15 +540,16 @@ class WasmGraphBuildingInterface {
   void AssertNullTypecheck(FullDecoder* decoder, const Value& obj,
                            Value* result) {
     builder_->TrapIfFalse(wasm::TrapReason::kTrapIllegalCast,
-                          builder_->IsNull(obj.node), decoder->position());
+                          builder_->IsNull(obj.node, obj.type),
+                          decoder->position());
     Forward(decoder, obj, result);
   }
 
   void AssertNotNullTypecheck(FullDecoder* decoder, const Value& obj,
                               Value* result) {
-    SetAndTypeNode(result,
-                   builder_->AssertNotNull(obj.node, decoder->position(),
-                                           TrapReason::kTrapIllegalCast));
+    SetAndTypeNode(
+        result, builder_->AssertNotNull(obj.node, obj.type, decoder->position(),
+                                        TrapReason::kTrapIllegalCast));
   }
 
   void NopForTestingUnsupportedInLiftoff(FullDecoder* decoder) {}
@@ -915,7 +917,7 @@ class WasmGraphBuildingInterface {
     SsaEnv* false_env = ssa_env_;
     SsaEnv* true_env = Split(decoder->zone(), false_env);
     false_env->SetNotMerged();
-    builder_->BrOnNull(ref_object.node, &true_env->control,
+    builder_->BrOnNull(ref_object.node, ref_object.type, &true_env->control,
                        &false_env->control);
     builder_->SetControl(false_env->control);
     {
@@ -934,7 +936,7 @@ class WasmGraphBuildingInterface {
     SsaEnv* false_env = ssa_env_;
     SsaEnv* true_env = Split(decoder->zone(), false_env);
     false_env->SetNotMerged();
-    builder_->BrOnNull(ref_object.node, &false_env->control,
+    builder_->BrOnNull(ref_object.node, ref_object.type, &false_env->control,
                        &true_env->control);
     builder_->SetControl(false_env->control);
     ScopedSsaEnv scoped_env(this, true_env);
@@ -1723,12 +1725,9 @@ class WasmGraphBuildingInterface {
   }
 
   void StringAsWtf16(FullDecoder* decoder, const Value& str, Value* result) {
-    // Since we implement stringview_wtf16 as string, that's the type we'll
-    // use for the Node. (The decoder's Value type must be stringview_wtf16
-    // because static type validation relies on it.)
-    result->node = builder_->SetType(
-        builder_->AssertNotNull(str.node, decoder->position()),
-        ValueType::Ref(HeapType::kString));
+    SetAndTypeNode(result,
+                   builder_->StringAsWtf16(str.node, NullCheckFor(str.type),
+                                           decoder->position()));
   }
 
   void StringViewWtf16GetCodeUnit(FullDecoder* decoder, const Value& view,
@@ -1800,6 +1799,12 @@ class WasmGraphBuildingInterface {
   void StringFromCodePoint(FullDecoder* decoder, const Value& code_point,
                            Value* result) {
     SetAndTypeNode(result, builder_->StringFromCodePoint(code_point.node));
+  }
+
+  void StringHash(FullDecoder* decoder, const Value& string, Value* result) {
+    SetAndTypeNode(result,
+                   builder_->StringHash(string.node, NullCheckFor(string.type),
+                                        decoder->position()));
   }
 
   void Forward(FullDecoder* decoder, const Value& from, Value* to) {
@@ -2351,14 +2356,13 @@ class WasmGraphBuildingInterface {
 
 }  // namespace
 
-DecodeResult BuildTFGraph(AccountingAllocator* allocator,
-                          const WasmFeatures& enabled, const WasmModule* module,
-                          compiler::WasmGraphBuilder* builder,
-                          WasmFeatures* detected, const FunctionBody& body,
-                          std::vector<compiler::WasmLoopInfo>* loop_infos,
-                          DanglingExceptions* dangling_exceptions,
-                          compiler::NodeOriginTable* node_origins,
-                          int func_index, InlinedStatus inlined_status) {
+void BuildTFGraph(AccountingAllocator* allocator, const WasmFeatures& enabled,
+                  const WasmModule* module, compiler::WasmGraphBuilder* builder,
+                  WasmFeatures* detected, const FunctionBody& body,
+                  std::vector<compiler::WasmLoopInfo>* loop_infos,
+                  DanglingExceptions* dangling_exceptions,
+                  compiler::NodeOriginTable* node_origins, int func_index,
+                  InlinedStatus inlined_status) {
   Zone zone(allocator, ZONE_NAME);
   WasmFullDecoder<Decoder::NoValidationTag, WasmGraphBuildingInterface> decoder(
       &zone, module, enabled, detected, body, builder, func_index,
@@ -2374,8 +2378,9 @@ DecodeResult BuildTFGraph(AccountingAllocator* allocator,
   if (dangling_exceptions != nullptr) {
     *dangling_exceptions = std::move(decoder.interface().dangling_exceptions());
   }
-
-  return decoder.toResult(nullptr);
+  // TurboFan does not run with validation, so graph building must always
+  // succeed.
+  CHECK(decoder.ok());
 }
 
 }  // namespace wasm

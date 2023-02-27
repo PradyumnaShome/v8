@@ -143,7 +143,7 @@ class Sweeper::SweeperJob final : public JobTask {
 namespace {
 void AssertMainThreadOrSharedMainThread(Heap* heap) {
   DCHECK(heap->IsMainThread() || (heap->IsSharedMainThread() &&
-                                  !heap->isolate()->is_shared_heap_isolate()));
+                                  !heap->isolate()->is_shared_space_isolate()));
 }
 }  // namespace
 
@@ -313,8 +313,8 @@ void Sweeper::SnapshotPageSets() {
   // No mutex needed for the main thread.
   std::tie(snapshot_normal_pages_set_, snapshot_large_pages_set_) =
       heap_->memory_allocator()->SnapshotPageSetsUnsafe();
-  if (heap_->isolate()->has_shared_heap()) {
-    Heap* shared_heap = heap_->isolate()->shared_heap_isolate()->heap();
+  if (heap_->isolate()->has_shared_space()) {
+    Heap* shared_heap = heap_->isolate()->shared_space_isolate()->heap();
     if (shared_heap == heap_) {
       // Current heap is the shared heap, thus all relevant pages have already
       // been snapshotted and no lock is required.
@@ -365,9 +365,6 @@ void Sweeper::StartSweeperTasks() {
     DCHECK(v8_flags.minor_mc);
     DCHECK_EQ(GarbageCollector::MINOR_MARK_COMPACTOR,
               current_new_space_collector_);
-    // Snapshotted page sets are only needed for concurrent promoted page
-    // iteration, which is not used during memory-reducing GCs.
-    DCHECK(!heap_->ShouldReduceMemory());
 
     DCHECK(snapshot_normal_pages_set_.empty());
     DCHECK(snapshot_large_pages_set_.empty());
@@ -1050,29 +1047,30 @@ bool Sweeper::TryRemoveSweepingPageSafe(AllocationSpace space, Page* page) {
 }
 
 void Sweeper::AddPage(AllocationSpace space, Page* page,
-                      Sweeper::AddPageMode mode) {
+                      Sweeper::AddPageMode mode, AccessMode mutex_mode) {
   DCHECK_NE(NEW_SPACE, space);
-  AddPageImpl(space, page, mode);
+  AddPageImpl(space, page, mode, mutex_mode);
 }
 
-void Sweeper::AddNewSpacePage(Page* page) {
+void Sweeper::AddNewSpacePage(Page* page, AccessMode mutex_mode) {
   DCHECK_EQ(NEW_SPACE, page->owner_identity());
   size_t live_bytes = marking_state_->live_bytes(page);
   heap_->IncrementNewSpaceSurvivingObjectSize(live_bytes);
   heap_->IncrementYoungSurvivorsCounter(live_bytes);
   page->ClearWasUsedForAllocation();
-  AddPageImpl(NEW_SPACE, page, AddPageMode::REGULAR);
+  AddPageImpl(NEW_SPACE, page, AddPageMode::REGULAR, mutex_mode);
 }
 
 void Sweeper::AddPromotedPageForIteration(MemoryChunk* chunk) {
   DCHECK(heap_->IsMainThread());
-  DCHECK(!heap_->ShouldReduceMemory());
   DCHECK(chunk->owner_identity() == OLD_SPACE ||
          chunk->owner_identity() == LO_SPACE);
   DCHECK_IMPLIES(v8_flags.concurrent_sweeping,
                  !job_handle_ || !job_handle_->IsValid());
-  DCHECK_GE(chunk->area_size(),
-            static_cast<size_t>(marking_state_->live_bytes(chunk)));
+  size_t live_bytes = marking_state_->live_bytes(chunk);
+  DCHECK_GE(chunk->area_size(), live_bytes);
+  heap_->IncrementPromotedObjectsSize(live_bytes);
+  heap_->IncrementYoungSurvivorsCounter(live_bytes);
 #if DEBUG
   if (!chunk->IsLargePage()) {
     static_cast<Page*>(chunk)->ForAllFreeListCategories(
@@ -1091,8 +1089,16 @@ void Sweeper::AddPromotedPageForIteration(MemoryChunk* chunk) {
 }
 
 void Sweeper::AddPageImpl(AllocationSpace space, Page* page,
-                          Sweeper::AddPageMode mode) {
-  base::MutexGuard guard(&mutex_);
+                          Sweeper::AddPageMode mode, AccessMode mutex_mode) {
+  base::Optional<base::MutexGuard> guard;
+  if (mutex_mode == AccessMode::ATOMIC) {
+    guard.emplace(&mutex_);
+  } else {
+    // This assert only checks that the non_atomic version is only used on the
+    // main thread. It would not catch cases where main thread add a page
+    // non-atomically while concurrent jobs are adding pages atomically.
+    AssertMainThreadOrSharedMainThread(heap_);
+  }
   DCHECK(IsValidSweepingSpace(space));
   DCHECK_IMPLIES(v8_flags.concurrent_sweeping,
                  !job_handle_ || !job_handle_->IsValid());
@@ -1192,6 +1198,54 @@ bool Sweeper::ShouldRefillFreelistForSpace(AllocationSpace space) const {
   DCHECK_IMPLIES(space == NEW_SPACE, v8_flags.minor_mc);
   return has_swept_pages_[GetSweepSpaceIndex(space)].load(
       std::memory_order_acquire);
+}
+
+void Sweeper::SweepEmptyNewSpacePage(Page* page) {
+  DCHECK(v8_flags.minor_mc);
+  DCHECK_EQ(NEW_SPACE, page->owner_identity());
+  DCHECK_EQ(0, marking_state_->live_bytes(page));
+  DCHECK(marking_state_->bitmap(page)->IsClean());
+  DCHECK(heap_->IsMainThread() ||
+         (heap_->IsSharedMainThread() &&
+          !heap_->isolate()->is_shared_space_isolate()));
+  DCHECK(heap_->tracer()->IsInAtomicPause());
+  DCHECK_EQ(Page::ConcurrentSweepingState::kDone,
+            page->concurrent_sweeping_state());
+
+  PagedSpaceBase* paged_space =
+      PagedNewSpace::From(heap_->new_space())->paged_space();
+
+  Address start = page->area_start();
+  size_t size = page->area_size();
+
+  if (Heap::ShouldZapGarbage()) {
+    static constexpr Tagged_t kZapTagged = static_cast<Tagged_t>(kZapValue);
+    const size_t size_in_tagged = size / kTaggedSize;
+    Tagged_t* current_addr = reinterpret_cast<Tagged_t*>(start);
+    for (size_t i = 0; i < size_in_tagged; ++i) {
+      base::AsAtomicPtr(current_addr++)
+          ->store(kZapTagged, std::memory_order_relaxed);
+    }
+  }
+
+  page->ClearWasUsedForAllocation();
+  page->ResetAllocationStatistics();
+  heap_->CreateFillerObjectAtSweeper(start, static_cast<int>(size));
+  paged_space->UnaccountedFree(start, size);
+  paged_space->IncreaseAllocatedBytes(0, page);
+  paged_space->RelinkFreeListCategories(page);
+
+  if (heap_->ShouldReduceMemory()) {
+    page->DiscardUnusedMemory(start, size);
+    // Only decrement counter when we discard unused system pages.
+    ActiveSystemPages active_system_pages_after_sweeping;
+    active_system_pages_after_sweeping.Init(
+        MemoryChunkLayout::kMemoryChunkHeaderSize,
+        MemoryAllocator::GetCommitPageSizeBits(), Page::kPageSize);
+    // Decrement accounted memory for discarded memory.
+    paged_space->ReduceActiveSystemPages(page,
+                                         active_system_pages_after_sweeping);
+  }
 }
 
 }  // namespace internal

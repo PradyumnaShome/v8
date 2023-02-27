@@ -49,31 +49,6 @@ class BaselineAssembler::ScratchRegisterScope {
   int registers_used_;
 };
 
-inline bool IsSignedCondition(Condition cond) {
-  switch (cond) {
-    case kEqual:
-    case kNotEqual:
-    case kLessThan:
-    case kGreaterThan:
-    case kLessThanEqual:
-    case kGreaterThanEqual:
-    case kOverflow:
-    case kNoOverflow:
-    case kZero:
-    case kNotZero:
-      return true;
-
-    case kUnsignedLessThan:
-    case kUnsignedGreaterThan:
-    case kUnsignedLessThanEqual:
-    case kUnsignedGreaterThanEqual:
-      return false;
-
-    default:
-      UNREACHABLE();
-  }
-}
-
 #define __ assm->
 // ppc helper
 template <int width = 64>
@@ -82,19 +57,19 @@ static void JumpIfHelper(MacroAssembler* assm, Condition cc, Register lhs,
   static_assert(width == 64 || width == 32,
                 "only support 64 and 32 bit compare");
   if (width == 64) {
-    if (IsSignedCondition(cc)) {
+    if (is_signed(cc)) {
       __ CmpS64(lhs, rhs);
     } else {
       __ CmpU64(lhs, rhs);
     }
   } else {
-    if (IsSignedCondition(cc)) {
+    if (is_signed(cc)) {
       __ CmpS32(lhs, rhs);
     } else {
       __ CmpU32(lhs, rhs);
     }
   }
-  __ b(check_condition(cc), target);
+  __ b(to_condition(cc), target);
 }
 #undef __
 
@@ -160,18 +135,27 @@ void BaselineAssembler::TestAndBranch(Register value, int mask, Condition cc,
                                       Label* target, Label::Distance) {
   ASM_CODE_COMMENT(masm_);
   __ AndU64(r0, value, Operand(mask), ip, SetRC);
-  __ b(check_condition(cc), target, cr0);
+  __ b(to_condition(cc), target, cr0);
 }
 
 void BaselineAssembler::JumpIf(Condition cc, Register lhs, const Operand& rhs,
                                Label* target, Label::Distance) {
   ASM_CODE_COMMENT(masm_);
-  if (IsSignedCondition(cc)) {
+  if (is_signed(cc)) {
     __ CmpS64(lhs, rhs, r0);
   } else {
     __ CmpU64(lhs, rhs, r0);
   }
-  __ b(check_condition(cc), target);
+  __ b(to_condition(cc), target);
+}
+
+void BaselineAssembler::JumpIfObjectTypeFast(Condition cc, Register object,
+                                             InstanceType instance_type,
+                                             Label* target,
+                                             Label::Distance distance) {
+  ScratchRegisterScope temps(this);
+  Register scratch = temps.AcquireScratch();
+  JumpIfObjectType(cc, object, instance_type, scratch, target, distance);
 }
 
 void BaselineAssembler::JumpIfObjectType(Condition cc, Register object,
@@ -231,7 +215,7 @@ void BaselineAssembler::JumpIfTagged(Condition cc, Register value,
                                      MemOperand operand, Label* target,
                                      Label::Distance) {
   ASM_CODE_COMMENT(masm_);
-  __ LoadTaggedPointerField(ip, operand, r0);
+  __ LoadTaggedField(ip, operand, r0);
   JumpIfHelper<COMPRESS_POINTERS_BOOL ? 32 : 64>(masm_, cc, value, ip, target);
 }
 
@@ -239,7 +223,7 @@ void BaselineAssembler::JumpIfTagged(Condition cc, MemOperand operand,
                                      Register value, Label* target,
                                      Label::Distance) {
   ASM_CODE_COMMENT(masm_);
-  __ LoadTaggedPointerField(ip, operand, r0);
+  __ LoadTaggedField(ip, operand, r0);
   JumpIfHelper<COMPRESS_POINTERS_BOOL ? 32 : 64>(masm_, cc, value, ip, target);
 }
 
@@ -399,10 +383,10 @@ void BaselineAssembler::Pop(T... registers) {
   detail::PopAllHelper<T...>::Pop(this, registers...);
 }
 
-void BaselineAssembler::LoadTaggedPointerField(Register output, Register source,
-                                               int offset) {
+void BaselineAssembler::LoadTaggedField(Register output, Register source,
+                                        int offset) {
   ASM_CODE_COMMENT(masm_);
-  __ LoadTaggedPointerField(output, FieldMemOperand(source, offset), r0);
+  __ LoadTaggedField(output, FieldMemOperand(source, offset), r0);
 }
 
 void BaselineAssembler::LoadTaggedSignedField(Register output, Register source,
@@ -416,12 +400,6 @@ void BaselineAssembler::LoadTaggedSignedFieldAndUntag(Register output,
                                                       int offset) {
   LoadTaggedSignedField(output, source, offset);
   SmiUntag(output);
-}
-
-void BaselineAssembler::LoadTaggedAnyField(Register output, Register source,
-                                           int offset) {
-  ASM_CODE_COMMENT(masm_);
-  __ LoadAnyTaggedField(output, FieldMemOperand(source, offset), r0);
 }
 
 void BaselineAssembler::LoadWord16FieldZeroExtend(Register output,
@@ -468,8 +446,8 @@ void BaselineAssembler::TryLoadOptimizedOsrCode(Register scratch_and_result,
                                                 Label* on_result,
                                                 Label::Distance) {
   Label fallthrough;
-  LoadTaggedPointerField(scratch_and_result, feedback_vector,
-                         FeedbackVector::OffsetOfElementAt(slot.ToInt()));
+  LoadTaggedField(scratch_and_result, feedback_vector,
+                  FeedbackVector::OffsetOfElementAt(slot.ToInt()));
   __ LoadWeakValue(scratch_and_result, scratch_and_result, &fallthrough);
 
   // Is it marked_for_deoptimization? If yes, clear the slot.
@@ -494,8 +472,8 @@ void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(
   ScratchRegisterScope scratch_scope(this);
   Register feedback_cell = scratch_scope.AcquireScratch();
   LoadFunction(feedback_cell);
-  LoadTaggedPointerField(feedback_cell, feedback_cell,
-                         JSFunction::kFeedbackCellOffset);
+  LoadTaggedField(feedback_cell, feedback_cell,
+                  JSFunction::kFeedbackCellOffset);
 
   Register interrupt_budget = scratch_scope.AcquireScratch();
   __ LoadU32(
@@ -519,8 +497,8 @@ void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(
   ScratchRegisterScope scratch_scope(this);
   Register feedback_cell = scratch_scope.AcquireScratch();
   LoadFunction(feedback_cell);
-  LoadTaggedPointerField(feedback_cell, feedback_cell,
-                         JSFunction::kFeedbackCellOffset);
+  LoadTaggedField(feedback_cell, feedback_cell,
+                  JSFunction::kFeedbackCellOffset);
 
   Register interrupt_budget = scratch_scope.AcquireScratch();
   __ LoadU32(
@@ -538,17 +516,17 @@ void BaselineAssembler::LdaContextSlot(Register context, uint32_t index,
                                        uint32_t depth) {
   ASM_CODE_COMMENT(masm_);
   for (; depth > 0; --depth) {
-    LoadTaggedPointerField(context, context, Context::kPreviousOffset);
+    LoadTaggedField(context, context, Context::kPreviousOffset);
   }
-  LoadTaggedAnyField(kInterpreterAccumulatorRegister, context,
-                     Context::OffsetOfElementAt(index));
+  LoadTaggedField(kInterpreterAccumulatorRegister, context,
+                  Context::OffsetOfElementAt(index));
 }
 
 void BaselineAssembler::StaContextSlot(Register context, Register value,
                                        uint32_t index, uint32_t depth) {
   ASM_CODE_COMMENT(masm_);
   for (; depth > 0; --depth) {
-    LoadTaggedPointerField(context, context, Context::kPreviousOffset);
+    LoadTaggedField(context, context, Context::kPreviousOffset);
   }
   StoreTaggedFieldWithWriteBarrier(context, Context::OffsetOfElementAt(index),
                                    value);
@@ -558,34 +536,30 @@ void BaselineAssembler::LdaModuleVariable(Register context, int cell_index,
                                           uint32_t depth) {
   ASM_CODE_COMMENT(masm_);
   for (; depth > 0; --depth) {
-    LoadTaggedPointerField(context, context, Context::kPreviousOffset);
+    LoadTaggedField(context, context, Context::kPreviousOffset);
   }
-  LoadTaggedPointerField(context, context, Context::kExtensionOffset);
+  LoadTaggedField(context, context, Context::kExtensionOffset);
   if (cell_index > 0) {
-    LoadTaggedPointerField(context, context,
-                           SourceTextModule::kRegularExportsOffset);
+    LoadTaggedField(context, context, SourceTextModule::kRegularExportsOffset);
     // The actual array index is (cell_index - 1).
     cell_index -= 1;
   } else {
-    LoadTaggedPointerField(context, context,
-                           SourceTextModule::kRegularImportsOffset);
+    LoadTaggedField(context, context, SourceTextModule::kRegularImportsOffset);
     // The actual array index is (-cell_index - 1).
     cell_index = -cell_index - 1;
   }
   LoadFixedArrayElement(context, context, cell_index);
-  LoadTaggedAnyField(kInterpreterAccumulatorRegister, context,
-                     Cell::kValueOffset);
+  LoadTaggedField(kInterpreterAccumulatorRegister, context, Cell::kValueOffset);
 }
 
 void BaselineAssembler::StaModuleVariable(Register context, Register value,
                                           int cell_index, uint32_t depth) {
   ASM_CODE_COMMENT(masm_);
   for (; depth > 0; --depth) {
-    LoadTaggedPointerField(context, context, Context::kPreviousOffset);
+    LoadTaggedField(context, context, Context::kPreviousOffset);
   }
-  LoadTaggedPointerField(context, context, Context::kExtensionOffset);
-  LoadTaggedPointerField(context, context,
-                         SourceTextModule::kRegularExportsOffset);
+  LoadTaggedField(context, context, Context::kExtensionOffset);
+  LoadTaggedField(context, context, SourceTextModule::kRegularExportsOffset);
 
   // The actual array index is (cell_index - 1).
   cell_index -= 1;
@@ -684,8 +658,8 @@ void BaselineAssembler::EmitReturn(MacroAssembler* masm) {
   __ masm()->LeaveFrame(StackFrame::BASELINE);
 
   // Drop receiver + arguments.
-  __ masm()->DropArguments(params_size, TurboAssembler::kCountIsInteger,
-                           TurboAssembler::kCountIncludesReceiver);
+  __ masm()->DropArguments(params_size, MacroAssembler::kCountIsInteger,
+                           MacroAssembler::kCountIncludesReceiver);
   __ masm()->Ret();
 }
 

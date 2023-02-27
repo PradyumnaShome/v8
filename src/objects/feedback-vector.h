@@ -27,7 +27,11 @@ namespace internal {
 class IsCompiledScope;
 class FeedbackVectorSpec;
 
-enum class UpdateFeedbackMode { kOptionalFeedback, kGuaranteedFeedback };
+enum class UpdateFeedbackMode {
+  kOptionalFeedback,
+  kGuaranteedFeedback,
+  kNoFeedback,
+};
 
 // Which feedback slots to clear in Clear().
 enum class ClearBehavior {
@@ -202,11 +206,6 @@ class FeedbackVector
   DEFINE_TORQUE_GENERATED_OSR_STATE()
   DEFINE_TORQUE_GENERATED_FEEDBACK_VECTOR_FLAGS()
   static_assert(TieringState::kLastTieringState <= TieringStateBits::kMax);
-
-  static const bool kFeedbackVectorMaybeOptimizedCodeIsStoreRelease = true;
-  using TorqueGeneratedFeedbackVector<FeedbackVector,
-                                      HeapObject>::maybe_optimized_code;
-  DECL_RELEASE_ACQUIRE_WEAK_ACCESSORS(maybe_optimized_code)
 
   static constexpr uint32_t kFlagsMaybeHasTurbofanCode =
       FeedbackVector::MaybeHasTurbofanCodeBit::kMask;

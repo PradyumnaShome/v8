@@ -13,8 +13,9 @@
 #include <utility>
 
 // Clients of this interface shouldn't depend on lots of compiler internals.
-// Do not include anything from src/compiler here!
+// Do not include anything else from src/compiler here!
 #include "src/base/small-vector.h"
+#include "src/compiler/wasm-compiler-definitions.h"
 #include "src/runtime/runtime.h"
 #include "src/wasm/function-body-decoder.h"
 #include "src/wasm/function-compiler.h"
@@ -253,10 +254,10 @@ class WasmGraphBuilder {
                              Node* tnode, Node* fnode);
   Node* CreateOrMergeIntoEffectPhi(Node* merge, Node* tnode, Node* fnode);
   Node* EffectPhi(unsigned count, Node** effects_and_control);
-  Node* RefNull();
+  Node* RefNull(wasm::ValueType type);
   Node* RefFunc(uint32_t function_index);
   Node* AssertNotNull(
-      Node* object, wasm::WasmCodePosition position,
+      Node* object, wasm::ValueType type, wasm::WasmCodePosition position,
       wasm::TrapReason reason = wasm::TrapReason::kTrapNullDereference);
   Node* TraceInstruction(uint32_t mark_id);
   Node* Int32Constant(int32_t value);
@@ -266,7 +267,9 @@ class WasmGraphBuilder {
   Node* Simd128Constant(const uint8_t value[16]);
   Node* Binop(wasm::WasmOpcode opcode, Node* left, Node* right,
               wasm::WasmCodePosition position = wasm::kNoCodePosition);
+  // The {type} argument is only required for null-checking operations.
   Node* Unop(wasm::WasmOpcode opcode, Node* input,
+             wasm::ValueType type = wasm::kWasmBottom,
              wasm::WasmCodePosition position = wasm::kNoCodePosition);
   Node* MemoryGrow(Node* input);
   Node* Throw(uint32_t tag_index, const wasm::WasmTag* tag,
@@ -352,7 +355,8 @@ class WasmGraphBuilder {
                                         Node** failure_control,
                                         bool is_last_case);
 
-  void BrOnNull(Node* ref_object, Node** non_null_node, Node** null_node);
+  void BrOnNull(Node* ref_object, wasm::ValueType type, Node** non_null_node,
+                Node** null_node);
 
   Node* Invert(Node* node);
 
@@ -534,6 +538,8 @@ class WasmGraphBuilder {
                            Node* start, Node* end);
   Node* StringNewWtf16(uint32_t memory, Node* offset, Node* size);
   Node* StringNewWtf16Array(Node* array, Node* start, Node* end);
+  Node* StringAsWtf16(Node* string, CheckForNull null_check,
+                      wasm::WasmCodePosition position);
   Node* StringConst(uint32_t index);
   Node* StringMeasureUtf8(Node* string, CheckForNull null_check,
                           wasm::WasmCodePosition position);
@@ -596,7 +602,9 @@ class WasmGraphBuilder {
                       CheckForNull null_check_rhs,
                       wasm::WasmCodePosition position);
   Node* StringFromCodePoint(Node* code_point);
-  Node* IsNull(Node* object);
+  Node* StringHash(Node* string, CheckForNull null_check,
+                   wasm::WasmCodePosition position);
+  Node* IsNull(Node* object, wasm::ValueType type);
   Node* TypeGuard(Node* value, wasm::ValueType type);
 
   bool has_simd() const { return has_simd_; }
@@ -786,9 +794,10 @@ class WasmGraphBuilder {
   void BrOnCastAbs(Node** match_control, Node** match_effect,
                    Node** no_match_control, Node** no_match_effect,
                    std::function<void(Callbacks)> type_checker);
-  void BoundsCheckArray(Node* array, Node* index,
+  void BoundsCheckArray(Node* array, Node* index, CheckForNull null_check,
                         wasm::WasmCodePosition position);
   void BoundsCheckArrayCopy(Node* array, Node* index, Node* length,
+                            CheckForNull null_check,
                             wasm::WasmCodePosition position);
 
   // Asm.js specific functionality.
@@ -820,10 +829,6 @@ class WasmGraphBuilder {
 
   Node* BuildMultiReturnFixedArrayFromIterable(const wasm::FunctionSig* sig,
                                                Node* iterable, Node* context);
-
-  Node* BuildLoadExternalPointerFromObject(
-      Node* object, int offset,
-      ExternalPointerTag tag = kForeignForeignAddressTag);
 
   Node* BuildLoadCallTargetFromExportedFunctionData(Node* function_data);
 
@@ -866,6 +871,7 @@ class WasmGraphBuilder {
   Parameter0Mode parameter_mode_;
   Isolate* const isolate_;
   SetOncePointer<Node> instance_node_;
+  NullCheckStrategy null_check_strategy_;
 };
 
 enum WasmCallKind { kWasmFunction, kWasmImportWrapper, kWasmCapiFunction };

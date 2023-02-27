@@ -90,6 +90,25 @@ class Arm64OperandGenerator final : public OperandGenerator {
   }
 
   bool CanBeImmediate(Node* node, ImmediateMode mode) {
+    if (node->opcode() == IrOpcode::kCompressedHeapConstant) {
+      if (!COMPRESS_POINTERS_BOOL) return false;
+      // For builtin code we need static roots
+      if (selector()->isolate()->bootstrapper() && !V8_STATIC_ROOTS_BOOL) {
+        return false;
+      }
+      const RootsTable& roots_table = selector()->isolate()->roots_table();
+      RootIndex root_index;
+      CompressedHeapObjectMatcher m(node);
+      if (m.HasResolvedValue() &&
+          roots_table.IsRootHandle(m.ResolvedValue(), &root_index)) {
+        if (!RootsTable::IsReadOnly(root_index)) return false;
+        return CanBeImmediate(MacroAssemblerBase::ReadOnlyRootPtr(
+                                  root_index, selector()->isolate()),
+                              mode);
+      }
+      return false;
+    }
+
     return IsIntegerConstant(node) &&
            CanBeImmediate(GetIntegerConstantValue(node), mode);
   }
@@ -623,7 +642,7 @@ void EmitLoad(InstructionSelector* selector, Node* node, InstructionCode opcode,
       selector->CanAddressRelativeToRootsRegister(m.ResolvedValue())) {
     ptrdiff_t const delta =
         g.GetIntegerConstantValue(index) +
-        TurboAssemblerBase::RootRegisterOffsetForExternalReference(
+        MacroAssemblerBase::RootRegisterOffsetForExternalReference(
             selector->isolate(), m.ResolvedValue());
     input_count = 1;
     // Check that the delta is a 32-bit integer due to the limitations of
@@ -680,7 +699,7 @@ void InstructionSelector::VisitLoadLane(Node* node) {
   InstructionCode opcode = kArm64LoadLane;
   opcode |= LaneSizeField::encode(params.rep.MemSize() * kBitsPerByte);
   if (params.kind == MemoryAccessKind::kProtected) {
-    opcode |= AccessModeField::encode(kMemoryAccessProtected);
+    opcode |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
   }
 
   Arm64OperandGenerator g(this);
@@ -698,7 +717,7 @@ void InstructionSelector::VisitStoreLane(Node* node) {
   opcode |=
       LaneSizeField::encode(ElementSizeInBytes(params.rep) * kBitsPerByte);
   if (params.kind == MemoryAccessKind::kProtected) {
-    opcode |= AccessModeField::encode(kMemoryAccessProtected);
+    opcode |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
   }
 
   Arm64OperandGenerator g(this);
@@ -788,7 +807,7 @@ void InstructionSelector::VisitLoadTransform(Node* node) {
     opcode |= AddressingModeField::encode(kMode_MRR);
   }
   if (params.kind == MemoryAccessKind::kProtected) {
-    opcode |= AccessModeField::encode(kMemoryAccessProtected);
+    opcode |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
   }
   Emit(opcode, 1, outputs, 2, inputs);
 }
@@ -843,11 +862,8 @@ void InstructionSelector::VisitLoad(Node* node) {
       immediate_mode = kLoadStoreImm32;
       break;
     case MachineRepresentation::kTaggedPointer:
-      opcode = kArm64LdrDecompressTaggedPointer;
-      immediate_mode = kLoadStoreImm32;
-      break;
     case MachineRepresentation::kTagged:
-      opcode = kArm64LdrDecompressAnyTagged;
+      opcode = kArm64LdrDecompressTagged;
       immediate_mode = kLoadStoreImm32;
       break;
 #else
@@ -873,7 +889,9 @@ void InstructionSelector::VisitLoad(Node* node) {
       UNREACHABLE();
   }
   if (node->opcode() == IrOpcode::kProtectedLoad) {
-    opcode |= AccessModeField::encode(kMemoryAccessProtected);
+    opcode |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
+  } else if (node->opcode() == IrOpcode::kLoadTrapOnNull) {
+    opcode |= AccessModeField::encode(kMemoryAccessProtectedNullDereference);
   }
 
   EmitLoad(this, node, opcode, immediate_mode, rep);
@@ -920,7 +938,12 @@ void InstructionSelector::VisitStore(Node* node) {
         WriteBarrierKindToRecordWriteMode(write_barrier_kind);
     InstructionCode code = kArchStoreWithWriteBarrier;
     code |= AddressingModeField::encode(addressing_mode);
+    // TODO(manoskouk): These two overlap. Introduce a more specialized smaller
+    // field for {RecordWriteMode}.
     code |= MiscField::encode(static_cast<int>(record_write_mode));
+    if (node->opcode() == IrOpcode::kStoreTrapOnNull) {
+      code |= AccessModeField::encode(kMemoryAccessProtectedNullDereference);
+    }
     Emit(code, 0, nullptr, input_count, inputs);
   } else {
     InstructionOperand inputs[4];
@@ -988,7 +1011,7 @@ void InstructionSelector::VisitStore(Node* node) {
         CanAddressRelativeToRootsRegister(m.ResolvedValue())) {
       ptrdiff_t const delta =
           g.GetIntegerConstantValue(index) +
-          TurboAssemblerBase::RootRegisterOffsetForExternalReference(
+          MacroAssemblerBase::RootRegisterOffsetForExternalReference(
               isolate(), m.ResolvedValue());
       if (is_int32(delta)) {
         input_count = 2;
@@ -1019,7 +1042,9 @@ void InstructionSelector::VisitStore(Node* node) {
     }
 
     if (node->opcode() == IrOpcode::kProtectedStore) {
-      opcode |= AccessModeField::encode(kMemoryAccessProtected);
+      opcode |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
+    } else if (node->opcode() == IrOpcode::kStoreTrapOnNull) {
+      opcode |= AccessModeField::encode(kMemoryAccessProtectedNullDereference);
     }
 
     Emit(opcode, 0, nullptr, input_count, inputs);
@@ -2706,14 +2731,20 @@ void VisitAtomicExchange(InstructionSelector* selector, Node* node,
   InstructionOperand inputs[] = {g.UseRegister(base), g.UseRegister(index),
                                  g.UseUniqueRegister(value)};
   InstructionOperand outputs[] = {g.DefineAsRegister(node)};
-  InstructionOperand temps[] = {g.TempRegister(), g.TempRegister()};
   InstructionCode code = opcode | AddressingModeField::encode(kMode_MRR) |
                          AtomicWidthField::encode(width);
   if (access_kind == MemoryAccessKind::kProtected) {
-    code |= AccessModeField::encode(kMemoryAccessProtected);
+    code |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
   }
-  selector->Emit(code, arraysize(outputs), outputs, arraysize(inputs), inputs,
-                 arraysize(temps), temps);
+  if (CpuFeatures::IsSupported(LSE)) {
+    InstructionOperand temps[] = {g.TempRegister()};
+    selector->Emit(code, arraysize(outputs), outputs, arraysize(inputs), inputs,
+                   arraysize(temps), temps);
+  } else {
+    InstructionOperand temps[] = {g.TempRegister(), g.TempRegister()};
+    selector->Emit(code, arraysize(outputs), outputs, arraysize(inputs), inputs,
+                   arraysize(temps), temps);
+  }
 }
 
 void VisitAtomicCompareExchange(InstructionSelector* selector, Node* node,
@@ -2727,15 +2758,23 @@ void VisitAtomicCompareExchange(InstructionSelector* selector, Node* node,
   InstructionOperand inputs[] = {g.UseRegister(base), g.UseRegister(index),
                                  g.UseUniqueRegister(old_value),
                                  g.UseUniqueRegister(new_value)};
-  InstructionOperand outputs[] = {g.DefineAsRegister(node)};
-  InstructionOperand temps[] = {g.TempRegister(), g.TempRegister()};
+  InstructionOperand outputs[1];
   InstructionCode code = opcode | AddressingModeField::encode(kMode_MRR) |
                          AtomicWidthField::encode(width);
   if (access_kind == MemoryAccessKind::kProtected) {
-    code |= AccessModeField::encode(kMemoryAccessProtected);
+    code |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
   }
-  selector->Emit(code, arraysize(outputs), outputs, arraysize(inputs), inputs,
-                 arraysize(temps), temps);
+  if (CpuFeatures::IsSupported(LSE)) {
+    InstructionOperand temps[] = {g.TempRegister()};
+    outputs[0] = g.DefineSameAsInput(node, 2);
+    selector->Emit(code, arraysize(outputs), outputs, arraysize(inputs), inputs,
+                   arraysize(temps), temps);
+  } else {
+    InstructionOperand temps[] = {g.TempRegister(), g.TempRegister()};
+    outputs[0] = g.DefineAsRegister(node);
+    selector->Emit(code, arraysize(outputs), outputs, arraysize(inputs), inputs,
+                   arraysize(temps), temps);
+  }
 }
 
 void VisitAtomicLoad(InstructionSelector* selector, Node* node,
@@ -2773,10 +2812,10 @@ void VisitAtomicLoad(InstructionSelector* selector, Node* node,
       code = kArm64LdarDecompressTaggedSigned;
       break;
     case MachineRepresentation::kTaggedPointer:
-      code = kArm64LdarDecompressTaggedPointer;
+      code = kArm64LdarDecompressTagged;
       break;
     case MachineRepresentation::kTagged:
-      code = kArm64LdarDecompressAnyTagged;
+      code = kArm64LdarDecompressTagged;
       break;
 #else
     case MachineRepresentation::kTaggedSigned:   // Fall through.
@@ -2799,7 +2838,7 @@ void VisitAtomicLoad(InstructionSelector* selector, Node* node,
   }
 
   if (atomic_load_params.kind() == MemoryAccessKind::kProtected) {
-    code |= AccessModeField::encode(kMemoryAccessProtected);
+    code |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
   }
 
   code |=
@@ -2875,7 +2914,7 @@ void VisitAtomicStore(InstructionSelector* selector, Node* node,
   }
 
   if (store_params.kind() == MemoryAccessKind::kProtected) {
-    code |= AccessModeField::encode(kMemoryAccessProtected);
+    code |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
   }
 
   code |= AddressingModeField::encode(kMode_MRR);
@@ -2894,15 +2933,22 @@ void VisitAtomicBinop(InstructionSelector* selector, Node* node,
   InstructionOperand inputs[] = {g.UseRegister(base), g.UseRegister(index),
                                  g.UseUniqueRegister(value)};
   InstructionOperand outputs[] = {g.DefineAsRegister(node)};
-  InstructionOperand temps[] = {g.TempRegister(), g.TempRegister(),
-                                g.TempRegister()};
   InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
                          AtomicWidthField::encode(width);
   if (access_kind == MemoryAccessKind::kProtected) {
-    code |= AccessModeField::encode(kMemoryAccessProtected);
+    code |= AccessModeField::encode(kMemoryAccessProtectedMemOutOfBounds);
   }
-  selector->Emit(code, arraysize(outputs), outputs, arraysize(inputs), inputs,
-                 arraysize(temps), temps);
+
+  if (CpuFeatures::IsSupported(LSE)) {
+    InstructionOperand temps[] = {g.TempRegister()};
+    selector->Emit(code, arraysize(outputs), outputs, arraysize(inputs), inputs,
+                   arraysize(temps), temps);
+  } else {
+    InstructionOperand temps[] = {g.TempRegister(), g.TempRegister(),
+                                  g.TempRegister()};
+    selector->Emit(code, arraysize(outputs), outputs, arraysize(inputs), inputs,
+                   arraysize(temps), temps);
+  }
 }
 
 }  // namespace
@@ -3173,6 +3219,43 @@ void InstructionSelector::VisitWord32Equal(Node* const node) {
       return VisitWord32Test(this, value, &cont);
     }
   }
+
+  if (isolate() && (V8_STATIC_ROOTS_BOOL ||
+                    (COMPRESS_POINTERS_BOOL && !isolate()->bootstrapper()))) {
+    Arm64OperandGenerator g(this);
+    const RootsTable& roots_table = isolate()->roots_table();
+    RootIndex root_index;
+    Node* left = nullptr;
+    Handle<HeapObject> right;
+    // HeapConstants and CompressedHeapConstants can be treated the same when
+    // using them as an input to a 32-bit comparison. Check whether either is
+    // present.
+    {
+      CompressedHeapObjectBinopMatcher m(node);
+      if (m.right().HasResolvedValue()) {
+        left = m.left().node();
+        right = m.right().ResolvedValue();
+      } else {
+        HeapObjectBinopMatcher m2(node);
+        if (m2.right().HasResolvedValue()) {
+          left = m2.left().node();
+          right = m2.right().ResolvedValue();
+        }
+      }
+    }
+    if (!right.is_null() && roots_table.IsRootHandle(right, &root_index)) {
+      DCHECK_NE(left, nullptr);
+      if (RootsTable::IsReadOnly(root_index)) {
+        Tagged_t ptr =
+            MacroAssemblerBase::ReadOnlyRootPtr(root_index, isolate());
+        if (g.CanBeImmediate(ptr, ImmediateMode::kArithmeticImm)) {
+          return VisitCompare(this, kArm64Cmp32, g.UseRegister(left),
+                              g.TempImmediate(ptr), &cont);
+        }
+      }
+    }
+  }
+
   VisitWord32Compare(this, node, &cont);
 }
 

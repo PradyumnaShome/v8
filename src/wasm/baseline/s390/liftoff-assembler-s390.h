@@ -18,26 +18,6 @@ namespace wasm {
 
 namespace liftoff {
 
-inline constexpr bool UseSignedOp(Condition cond) {
-  switch (cond) {
-    case kEqual:
-    case kNotEqual:
-    case kLessThan:
-    case kLessThanEqual:
-    case kGreaterThan:
-    case kGreaterThanEqual:
-      return true;
-    case kUnsignedLessThan:
-    case kUnsignedLessThanEqual:
-    case kUnsignedGreaterThan:
-    case kUnsignedGreaterThanEqual:
-      return false;
-    default:
-      UNREACHABLE();
-  }
-  return false;
-}
-
 //  half
 //  slot        Frame
 //  -----+--------------------+---------------------------
@@ -182,7 +162,7 @@ void LiftoffAssembler::PatchPrepareStackFrame(
   bind(&continuation);
 
   // Now allocate the stack space. Note that this might do more than just
-  // decrementing the SP; consult {TurboAssembler::AllocateStackSpace}.
+  // decrementing the SP; consult {MacroAssembler::AllocateStackSpace}.
   lay(sp, MemOperand(sp, -frame_size));
 
   // Jump back to the start of the function, from {pc_offset()} to
@@ -266,7 +246,7 @@ void LiftoffAssembler::LoadTaggedPointerFromInstance(Register dst,
                                                      Register instance,
                                                      int offset) {
   DCHECK_LE(0, offset);
-  LoadTaggedPointerField(dst, MemOperand(instance, offset));
+  LoadTaggedField(dst, MemOperand(instance, offset));
 }
 
 void LiftoffAssembler::SpillInstance(Register instance) {
@@ -284,7 +264,7 @@ void LiftoffAssembler::LoadTaggedPointer(Register dst, Register src_addr,
     ShiftLeftU64(ip, offset_reg, Operand(shift_amount));
     offset_reg = ip;
   }
-  LoadTaggedPointerField(
+  LoadTaggedField(
       dst,
       MemOperand(src_addr, offset_reg == no_reg ? r0 : offset_reg, offset_imm));
 }
@@ -307,15 +287,12 @@ void LiftoffAssembler::StoreTaggedPointer(Register dst_addr,
 
   if (skip_write_barrier || v8_flags.disable_write_barriers) return;
 
-  Label write_barrier;
   Label exit;
   CheckPageFlag(dst_addr, r1, MemoryChunk::kPointersFromHereAreInterestingMask,
-                ne, &write_barrier);
-  b(&exit);
-  bind(&write_barrier);
+                kZero, &exit);
   JumpIfSmi(src.gp(), &exit);
   if (COMPRESS_POINTERS_BOOL) {
-    DecompressTaggedPointer(src.gp(), src.gp());
+    DecompressTagged(src.gp(), src.gp());
   }
   CheckPageFlag(src.gp(), r1,
                 MemoryChunk::kPointersToHereAreInterestingOrInSharedHeapMask,
@@ -2106,7 +2083,7 @@ void LiftoffAssembler::emit_cond_jump(Condition cond, Label* label,
                                       ValueKind kind, Register lhs,
                                       Register rhs,
                                       const FreezeCacheState& frozen) {
-  bool use_signed = liftoff::UseSignedOp(cond);
+  bool use_signed = is_signed(cond);
 
   if (rhs != no_reg) {
     switch (kind) {
@@ -2151,19 +2128,19 @@ void LiftoffAssembler::emit_cond_jump(Condition cond, Label* label,
     CmpS32(lhs, Operand::Zero());
   }
 
-  b(cond, label);
+  b(to_condition(cond), label);
 }
 
 void LiftoffAssembler::emit_i32_cond_jumpi(Condition cond, Label* label,
                                            Register lhs, int32_t imm,
                                            const FreezeCacheState& frozen) {
-  bool use_signed = liftoff::UseSignedOp(cond);
+  bool use_signed = is_signed(cond);
   if (use_signed) {
     CmpS32(lhs, Operand(imm));
   } else {
     CmpU32(lhs, Operand(imm));
   }
-  b(cond, label);
+  b(to_condition(cond), label);
 }
 
 #define EMIT_EQZ(test, src) \
@@ -2198,14 +2175,14 @@ void LiftoffAssembler::emit_i32_eqz(Register dst, Register src) {
 
 void LiftoffAssembler::emit_i32_set_cond(Condition cond, Register dst,
                                          Register lhs, Register rhs) {
-  bool use_signed = liftoff::UseSignedOp(cond);
+  bool use_signed = is_signed(cond);
   if (use_signed) {
     CmpS32(lhs, rhs);
   } else {
     CmpU32(lhs, rhs);
   }
 
-  EMIT_SET_CONDITION(dst, cond);
+  EMIT_SET_CONDITION(dst, to_condition(cond));
 }
 
 void LiftoffAssembler::emit_i64_eqz(Register dst, LiftoffRegister src) {
@@ -2215,28 +2192,28 @@ void LiftoffAssembler::emit_i64_eqz(Register dst, LiftoffRegister src) {
 void LiftoffAssembler::emit_i64_set_cond(Condition cond, Register dst,
                                          LiftoffRegister lhs,
                                          LiftoffRegister rhs) {
-  bool use_signed = liftoff::UseSignedOp(cond);
+  bool use_signed = is_signed(cond);
   if (use_signed) {
     CmpS64(lhs.gp(), rhs.gp());
   } else {
     CmpU64(lhs.gp(), rhs.gp());
   }
 
-  EMIT_SET_CONDITION(dst, cond);
+  EMIT_SET_CONDITION(dst, to_condition(cond));
 }
 
 void LiftoffAssembler::emit_f32_set_cond(Condition cond, Register dst,
                                          DoubleRegister lhs,
                                          DoubleRegister rhs) {
   cebr(lhs, rhs);
-  EMIT_SET_CONDITION(dst, cond);
+  EMIT_SET_CONDITION(dst, to_condition(cond));
 }
 
 void LiftoffAssembler::emit_f64_set_cond(Condition cond, Register dst,
                                          DoubleRegister lhs,
                                          DoubleRegister rhs) {
   cdbr(lhs, rhs);
-  EMIT_SET_CONDITION(dst, cond);
+  EMIT_SET_CONDITION(dst, to_condition(cond));
 }
 
 bool LiftoffAssembler::emit_select(LiftoffRegister dst, Register condition,
@@ -2817,14 +2794,18 @@ void LiftoffAssembler::emit_i16x8_q15mulr_sat_s(LiftoffRegister dst,
 void LiftoffAssembler::emit_i16x8_dot_i8x16_i7x16_s(LiftoffRegister dst,
                                                     LiftoffRegister lhs,
                                                     LiftoffRegister rhs) {
-  bailout(kSimd, "emit_i16x8_dot_i8x16_i7x16_s");
+  I16x8DotI8x16S(dst.fp(), lhs.fp(), rhs.fp(), kScratchDoubleReg);
 }
 
 void LiftoffAssembler::emit_i32x4_dot_i8x16_i7x16_add_s(LiftoffRegister dst,
                                                         LiftoffRegister lhs,
                                                         LiftoffRegister rhs,
                                                         LiftoffRegister acc) {
-  bailout(kSimd, "emit_i32x4_dot_i8x16_i7x16_add_s");
+  // Make sure temp register is unique.
+  Simd128Register temp =
+      GetUnusedRegister(kFpReg, LiftoffRegList{dst, lhs, rhs}).fp();
+  I32x4DotI8x16AddS(dst.fp(), lhs.fp(), rhs.fp(), acc.fp(), kScratchDoubleReg,
+                    temp);
 }
 
 void LiftoffAssembler::emit_i8x16_shuffle(LiftoffRegister dst,
@@ -2966,7 +2947,7 @@ void LiftoffAssembler::CallTrapCallbackForTesting() {
 
 void LiftoffAssembler::AssertUnreachable(AbortReason reason) {
   // Asserts unreachable within the wasm code.
-  TurboAssembler::AssertUnreachable(reason);
+  MacroAssembler::AssertUnreachable(reason);
 }
 
 void LiftoffAssembler::PushRegisters(LiftoffRegList regs) {
@@ -3120,7 +3101,7 @@ void LiftoffAssembler::CallRuntimeStub(WasmCode::RuntimeStubId sid) {
 
 void LiftoffAssembler::AllocateStackSlot(Register addr, uint32_t size) {
   lay(sp, MemOperand(sp, -size));
-  TurboAssembler::Move(addr, sp);
+  MacroAssembler::Move(addr, sp);
 }
 
 void LiftoffAssembler::DeallocateStackSlot(uint32_t size) {
